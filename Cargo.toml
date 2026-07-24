@@ -1,0 +1,22 @@
+# Copyright (c) 2026 LiteSDB contributors.
+# SPDX-License-Identifier: LGPL-3.0-only
+# This file is part of LiteSDB. See LICENSE for license details.
+# Project: https://github.com/probair/litesdb
+
+[workspace]
+members = ["core", "cli"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "LGPL-3.0-only"
+repository = "https://github.com/probair/litesdb"
+rust-version = "1.89"
+version = "0.1.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true
