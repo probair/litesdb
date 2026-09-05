@@ -267,3 +267,95 @@ fn compaction_cross_checks_manifest_totals() {
         Some(ErrorKind::Corruption)
     );
 }
+
+fn append_sparse_rows(tail: &mut TailIndex, table: TableId, start: i64, rows: i64) {
+    for timestamp in start..start + rows {
+        let bits = match timestamp % 4 {
+            0 => 0x7fc0_1234,
+            1 => 0x8000_0000,
+            2 => 0x0000_0001,
+            _ => 0xff80_0000,
+        };
+        let integer = if timestamp % 7 == 0 {
+            CellValue::Null
+        } else {
+            CellValue::UInt(timestamp.unsigned_abs())
+        };
+        let mut values = vec![
+            (1, 1, integer),
+            (1, 2, CellValue::F32Bits(F32Bits::from_bits(bits))),
+        ];
+        if timestamp == 20_000 {
+            values.push((2, 1, CellValue::UInt(17)));
+        }
+        if timestamp == 39_999 {
+            values.push((3, 2, CellValue::F32Bits(F32Bits::from_bits(0xffc0_5678))));
+        }
+        let sequence = timestamp.unsigned_abs() + 2;
+        apply(
+            tail,
+            sequence,
+            RecordBody::AppendObservation {
+                table,
+                observation: observation(timestamp, &values),
+            },
+        );
+    }
+}
+
+#[test]
+fn compaction_sparse_facts_survive_memory_split_inside_source() {
+    let table = TableId::new(1);
+    let mut first = TailIndex::new(0, 1);
+    apply(
+        &mut first,
+        1,
+        RecordBody::CreateTable {
+            table,
+            spec: spec(),
+        },
+    );
+    append_sparse_rows(&mut first, table, 0, 20_000);
+    let first_unit =
+        seal_snapshot(&first, 1).unwrap_or_else(|_| unreachable!("first valid L0 Seal rejected"));
+    let versions = first
+        .table(table)
+        .unwrap_or_else(|| unreachable!("created table is absent"))
+        .versions()
+        .to_vec();
+    let mut second = TailIndex::restore(
+        1,
+        20_002,
+        vec![RecoveredTable::new(
+            table,
+            Some(19_999),
+            versions,
+            vec![],
+            vec![],
+        )],
+    )
+    .unwrap_or_else(|_| unreachable!("valid restored schema rejected"));
+    append_sparse_rows(&mut second, table, 20_000, 20_000);
+    let second_unit =
+        seal_snapshot(&second, 2).unwrap_or_else(|_| unreachable!("second valid L0 Seal rejected"));
+    assert_eq!(first_unit.meta().section_count(), 1);
+    assert_eq!(second_unit.meta().section_count(), 1);
+    let inputs = [first_unit.meta(), second_unit.meta()];
+    let mut source = MemoryUnits::default();
+    source.insert(&first_unit);
+    source.insert(&second_unit);
+    let expected = facts(&source, &inputs, &second);
+    assert_eq!(expected.len(), 80_002);
+
+    let compacted = assemble(&inputs, &source, &second, 3)
+        .unwrap_or_else(|_| unreachable!("valid sparse compaction rejected"));
+    assert_eq!(compacted.meta().total_rows(), 40_000);
+    assert_eq!(compacted.meta().section_count(), 2);
+    let layout = decode_layout(compacted.bytes(), 3)
+        .unwrap_or_else(|_| unreachable!("valid compacted layout rejected"));
+    assert!(layout.sections()[0].max_ts() > 20_000);
+    assert!(layout.sections()[0].row_count() < crate::limits::MAX_SECTION_ROWS);
+    assert!(layout.sections()[1].min_ts() < 39_999);
+    source.insert(&compacted);
+    assert_eq!(facts(&source, &[compacted.meta()], &second), expected);
+}

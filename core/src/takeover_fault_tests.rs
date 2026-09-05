@@ -33,7 +33,7 @@ fn options() -> OpenOptions {
             bytes: 90,
             ..SealPolicy::default()
         },
-        wal_max_bytes: 185,
+        wal_max_bytes: 512,
         ..OpenOptions::default()
     }
 }

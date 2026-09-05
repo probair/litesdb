@@ -404,6 +404,7 @@ fn open_report_counts_replay_and_physical_tail_repair() {
         .unwrap_or_else(|_| unreachable!("open WAL"))
         .set_len(length.saturating_sub(3))
         .unwrap_or_else(|_| unreachable!("truncate WAL"));
+    let damaged_bytes = fs::read(active).unwrap_or_else(|_| unreachable!("read damaged WAL"));
 
     let (database, report) = Db::open_with_report(root.path(), OpenOptions::default())
         .unwrap_or_else(|_| unreachable!("reopen"));
@@ -413,9 +414,20 @@ fn open_report_counts_replay_and_physical_tail_repair() {
         report.repaired_bytes(),
         length.saturating_sub(3).saturating_sub(repair_start)
     );
-    assert_eq!(report.recovery_checkpointed_records(), 0);
+    assert_eq!(report.recovery_checkpointed_records(), 1);
     assert_eq!(report.recovery_unit_id(), None);
-    assert!(report.wal_bytes() > 32);
+    assert_eq!(report.wal_bytes(), 32);
+    assert_eq!(report.wal_storage_bytes(), length.saturating_sub(3) + 32);
+    let preserved = fs::read_dir(root.path().join("wal/damaged"))
+        .unwrap_or_else(|_| unreachable!("damaged directory"))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|_| unreachable!("damaged entry"))
+                .path()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(preserved.len(), 1);
+    assert_eq!(fs::read(&preserved[0]).ok(), Some(damaged_bytes));
     assert_eq!(
         database
             .maintenance_status()

@@ -82,7 +82,7 @@ pub(crate) fn initialize_new(directory: &DbDir, config: WriterConfig) -> Result<
 
 pub(crate) fn finalize_open(database: &Db, takeover: bool) -> Result<SealReport> {
     let (target_epoch, seal_required) = {
-        let engine = database.lock_engine()?;
+        let mut engine = database.lock_engine()?;
         let current_epoch = engine.manifest.identity().writer_epoch();
         let target_epoch = if takeover {
             current_epoch
@@ -124,11 +124,14 @@ pub(crate) fn finalize_open(database: &Db, takeover: bool) -> Result<SealReport>
                 "MANIFEST successor disagrees with target epoch",
             ));
         }
-        manifest::publish(
+        if let Err(error) = manifest::publish(
             &database.directory,
             Some(engine.manifest.identity().generation()),
             &next,
-        )?;
+        ) {
+            engine.writer.mark_poisoned();
+            return Err(error);
+        }
         engine.manifest = next;
     }
     engine

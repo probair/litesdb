@@ -9,7 +9,7 @@
 )]
 
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{BufReader, Read, Seek, SeekFrom},
     path::PathBuf,
 };
@@ -18,19 +18,22 @@ const REPLAY_BUFFER_BYTES: usize = 65_536;
 
 #[path = "recover_epoch.rs"]
 mod recover_epoch;
+#[path = "recover_scan.rs"]
+mod recover_scan;
 
 use crate::{
     Error, Result,
     fsutil::{Area, DbDir, sync_directory},
-    limits::{MAX_LIVE_UNITS, MAX_WAL_BYTES, MAX_WAL_SEGMENT_BYTES},
+    limits::{MAX_WAL_BYTES, MAX_WAL_SEGMENT_BYTES},
     wal::{
-        record::{self, RECORD_HEADER_BYTES},
         segment::{SEGMENT_HEADER_BYTES, SegmentHeader, parse_segment_name},
+        storage,
         tail::ReplayTarget,
     },
 };
 
 use recover_epoch::{ensure_epoch_order, validate_prefix};
+use recover_scan::replay_segment;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Checkpoint {
@@ -79,6 +82,8 @@ pub(crate) struct RecoveryOutcome {
     replayed_records: u64,
     tail_repairs: u64,
     repaired_bytes: u64,
+    needs_rotation: bool,
+    storage_bytes: u64,
 }
 
 impl RecoveryOutcome {
@@ -117,6 +122,14 @@ impl RecoveryOutcome {
     pub(crate) const fn repaired_bytes(self) -> u64 {
         self.repaired_bytes
     }
+
+    pub(crate) const fn needs_rotation(self) -> bool {
+        self.needs_rotation
+    }
+
+    pub(crate) const fn storage_bytes(self) -> u64 {
+        self.storage_bytes
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +156,7 @@ pub(crate) fn recover<T: ReplayTarget>(
     let mut wal_bytes = 0_u64;
     let mut tail_repairs = 0_u64;
     let mut repaired_bytes = 0_u64;
+    let mut needs_rotation = false;
     let mut previous_epoch = validate_prefix(
         directory,
         &segments[..start],
@@ -163,7 +177,7 @@ pub(crate) fn recover<T: ReplayTarget>(
             ));
         }
         let discovered_len = fs::metadata(&segment.path)?.len();
-        let Some((mut file, file_len, header_len, header)) = open_segment(
+        let Some((file, file_len, header_len, header)) = open_segment(
             directory,
             segment,
             is_checkpoint,
@@ -173,35 +187,30 @@ pub(crate) fn recover<T: ReplayTarget>(
         )?
         else {
             account_repair(&mut tail_repairs, &mut repaired_bytes, discovered_len)?;
+            needs_rotation = true;
             break;
         };
         ensure_epoch_order(previous_epoch, header.writer_epoch())?;
         previous_epoch = Some(header.writer_epoch());
-        let mut position = if is_checkpoint {
+        let position = if is_checkpoint {
             checkpoint.offset
         } else {
             header_len
         };
-        if position > file_len {
-            return Err(Error::corruption(
-                "WAL checkpoint",
-                "offset exceeds segment length",
-            ));
-        }
-        file.seek(SeekFrom::Start(position))?;
-        let mut reader = BufReader::with_capacity(REPLAY_BUFFER_BYTES, file);
-        let (effective_len, removed_bytes) = replay_segment(
-            &mut reader,
-            file_len,
-            position,
+        let replay = replay_file(
+            directory,
+            segment,
+            file,
+            position..file_len,
             is_last,
             &mut expected_seq,
             target,
         )?;
-        if removed_bytes > 0 {
-            account_repair(&mut tail_repairs, &mut repaired_bytes, removed_bytes)?;
+        if replay.excluded > 0 {
+            account_repair(&mut tail_repairs, &mut repaired_bytes, replay.excluded)?;
         }
-        position = effective_len;
+        needs_rotation = replay.frozen;
+        let effective_len = replay.end;
         wal_bytes = account_wal_bytes(
             wal_bytes,
             effective_len,
@@ -210,7 +219,7 @@ pub(crate) fn recover<T: ReplayTarget>(
             checkpoint.offset,
         )?;
         active_segment = Some(segment.first_seq);
-        active_offset = position;
+        active_offset = effective_len;
         active_epoch = Some(header.writer_epoch());
     }
 
@@ -230,6 +239,68 @@ pub(crate) fn recover<T: ReplayTarget>(
             .ok_or_else(|| Error::corruption("WAL recovery", "replay count underflow"))?,
         tail_repairs,
         repaired_bytes,
+        needs_rotation,
+        storage_bytes: storage::measure(&directory.path(Area::Wal))?,
+    })
+}
+
+struct ReplayedFile {
+    end: u64,
+    excluded: u64,
+    frozen: bool,
+}
+
+fn replay_file<T: ReplayTarget>(
+    directory: &DbDir,
+    segment: &SegmentFile,
+    mut file: File,
+    range: std::ops::Range<u64>,
+    is_last: bool,
+    expected_seq: &mut u64,
+    target: &mut T,
+) -> Result<ReplayedFile> {
+    if range.start > range.end {
+        return Err(Error::corruption(
+            "WAL checkpoint",
+            "offset exceeds segment length",
+        ));
+    }
+    file.seek(SeekFrom::Start(range.start))?;
+    let wal_directory = directory.path(Area::Wal);
+    let boundary = storage::frozen_boundary(&wal_directory, segment.first_seq)?;
+    let replay_len = boundary.map_or(range.end, |boundary| boundary.offset);
+    if replay_len < range.start {
+        return Err(Error::corruption(
+            "WAL recovery",
+            "frozen boundary precedes checkpoint",
+        ));
+    }
+    let mut reader = BufReader::with_capacity(REPLAY_BUFFER_BYTES, file);
+    let (end, removed) = replay_segment(
+        &mut reader,
+        replay_len,
+        range.start,
+        is_last && boundary.is_none(),
+        expected_seq,
+        target,
+    )?;
+    if boundary.is_some_and(|boundary| *expected_seq != boundary.next_seq) {
+        return Err(Error::corruption(
+            "WAL recovery",
+            "frozen boundary sequence mismatch",
+        ));
+    }
+    let excluded = if removed > 0
+        && storage::preserve(&wal_directory, segment.first_seq, end, *expected_seq)?
+    {
+        removed
+    } else {
+        0
+    };
+    Ok(ReplayedFile {
+        end,
+        excluded,
+        frozen: removed > 0 || boundary.is_some(),
     })
 }
 
@@ -251,10 +322,7 @@ fn open_segment(
     expected_shard_id: u64,
     expected_writer_epoch: u64,
 ) -> Result<Option<(File, u64, u64, SegmentHeader)>> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&segment.path)?;
+    let mut file = File::open(&segment.path)?;
     let file_len = file.metadata()?.len();
     if file_len > u64::from(MAX_WAL_SEGMENT_BYTES) {
         return Err(Error::limit(
@@ -267,6 +335,12 @@ fn open_segment(
         .map_err(|_| Error::corruption("WAL segment", "header length does not fit u64"))?;
     if file_len < header_len {
         if is_last && !is_checkpoint {
+            storage::preserve(
+                &directory.path(Area::Wal),
+                segment.first_seq,
+                0,
+                segment.first_seq,
+            )?;
             drop(file);
             fs::remove_file(&segment.path)?;
             sync_directory(&directory.path(Area::Wal))?;
@@ -309,124 +383,15 @@ fn account_wal_bytes(
     Ok(total)
 }
 
-fn replay_segment<T: ReplayTarget>(
-    reader: &mut BufReader<File>,
-    file_len: u64,
-    mut position: u64,
-    is_last: bool,
-    expected_seq: &mut u64,
-    target: &mut T,
-) -> Result<(u64, u64)> {
-    let record_header = u64::try_from(RECORD_HEADER_BYTES)
-        .map_err(|_| Error::corruption("WAL record", "header length does not fit u64"))?;
-    let mut frame = Vec::new();
-    while position < file_len {
-        let remaining = file_len
-            .checked_sub(position)
-            .ok_or_else(|| Error::corruption("WAL recovery", "remaining byte underflow"))?;
-        if remaining < record_header {
-            return repair_or_corrupt(
-                reader.get_mut(),
-                position,
-                is_last,
-                "incomplete record header",
-            );
-        }
-        let mut header = [0_u8; RECORD_HEADER_BYTES];
-        reader.read_exact(&mut header)?;
-        let Ok(frame_len) = record::framed_len(&header) else {
-            return repair_or_corrupt(
-                reader.get_mut(),
-                position,
-                is_last,
-                "invalid payload length",
-            );
-        };
-        let frame_len_u64 = u64::try_from(frame_len)
-            .map_err(|_| Error::corruption("WAL recovery", "frame length does not fit u64"))?;
-        let frame_end = position
-            .checked_add(frame_len_u64)
-            .ok_or_else(|| Error::corruption("WAL recovery", "frame end overflow"))?;
-        if frame_end > file_len {
-            return repair_or_corrupt(
-                reader.get_mut(),
-                position,
-                is_last,
-                "incomplete record payload",
-            );
-        }
-        frame.resize(frame_len, 0);
-        frame[..RECORD_HEADER_BYTES].copy_from_slice(&header);
-        reader.read_exact(&mut frame[RECORD_HEADER_BYTES..])?;
-        let actual_seq = match record::inspect(&frame) {
-            Ok(seq) => seq,
-            Err(_) if is_last && frame_end == file_len => {
-                return repair_or_corrupt(
-                    reader.get_mut(),
-                    position,
-                    true,
-                    "invalid final record CRC",
-                );
-            }
-            Err(_) => return Err(Error::corruption("WAL recovery", "invalid non-tail record")),
-        };
-        if actual_seq != *expected_seq {
-            return Err(Error::corruption("WAL recovery", "record sequence gap"));
-        }
-        let decoded = record::decode_inspected(&frame, actual_seq, |table, field| {
-            target.field_type(table, field)
-        })?;
-        target.apply(decoded.seq(), decoded.into_body())?;
-        *expected_seq = expected_seq
-            .checked_add(1)
-            .ok_or_else(|| Error::corruption("WAL recovery", "sequence overflow"))?;
-        position = frame_end;
-    }
-    Ok((position, 0))
-}
-
-fn repair_or_corrupt(
-    file: &mut File,
-    position: u64,
-    is_last: bool,
-    reason: &'static str,
-) -> Result<(u64, u64)> {
-    if !is_last {
-        return Err(Error::corruption("WAL recovery", reason));
-    }
-    let removed = file
-        .metadata()?
-        .len()
-        .checked_sub(position)
-        .ok_or_else(|| Error::corruption("WAL recovery", "repair length underflow"))?;
-    file.set_len(position)?;
-    file.sync_data()?;
-    Ok((position, removed))
-}
-
 fn discover_segments(directory: &DbDir) -> Result<Vec<SegmentFile>> {
     let mut segments = Vec::new();
-    for entry in fs::read_dir(directory.path(Area::Wal))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            return Err(Error::corruption("WAL directory", "entry is not a file"));
-        }
-        let name = entry
+    for path in storage::live_segments(&directory.path(Area::Wal))? {
+        let name = path
             .file_name()
-            .into_string()
-            .map_err(|_| Error::corruption("WAL directory", "file name is not UTF-8"))?;
-        let first_seq = parse_segment_name(&name)?;
-        segments.push(SegmentFile {
-            first_seq,
-            path: entry.path(),
-        });
-        if segments.len() > usize::try_from(MAX_LIVE_UNITS).unwrap_or(usize::MAX) {
-            return Err(Error::limit(
-                "wal_segments",
-                u64::try_from(segments.len()).unwrap_or(u64::MAX),
-                u64::from(MAX_LIVE_UNITS),
-            ));
-        }
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::corruption("WAL directory", "file name is not UTF-8"))?;
+        let first_seq = parse_segment_name(name)?;
+        segments.push(SegmentFile { first_seq, path });
     }
     segments.sort_unstable_by_key(|segment| segment.first_seq);
     Ok(segments)
@@ -447,3 +412,7 @@ fn cleanup_pre_checkpoint(directory: &DbDir, obsolete: &[SegmentFile]) {
 #[cfg(test)]
 #[path = "recover_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "recover_boundary_tests.rs"]
+mod boundary_tests;

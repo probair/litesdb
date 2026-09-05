@@ -70,7 +70,7 @@ fn append_and_sync_positions_are_exact() {
 
 #[test]
 fn soft_and_hard_capacity_watermarks_are_exact() {
-    let (_temporary, directory, config) = database("wal-writer-capacity", 100, 60);
+    let (_temporary, directory, config) = database("wal-writer-capacity", 132, 60);
     let mut writer =
         WalWriter::create(&directory, config, 0, 0, 1).unwrap_or_else(|_| unreachable!());
     assert!(
@@ -108,6 +108,112 @@ fn minimum_wal_budget_includes_takeover_headroom() {
         Some(ErrorKind::InvalidArgument)
     );
     assert!(WriterConfig::new(segment_bytes, 85, 85).is_ok());
+}
+
+#[test]
+fn checkpoint_reserve_bounds_repeated_recycling() {
+    let (_temporary, directory, config) = database("wal-writer-recycle", 85, 85);
+    let mut writer =
+        WalWriter::create(&directory, config, 0, 0, 1).unwrap_or_else(|_| unreachable!());
+    for seq in 1..=20 {
+        assert_eq!(
+            writer.append_requires_checkpoint(&drop_record(1)).ok(),
+            Some(false)
+        );
+        assert_eq!(
+            writer
+                .append(&drop_record(1))
+                .ok()
+                .map(super::AppendOutcome::seq),
+            Some(seq)
+        );
+        assert_eq!(writer.storage_bytes(), 53);
+        assert_eq!(
+            writer.append_requires_checkpoint(&drop_record(1)).ok(),
+            Some(true)
+        );
+        let position = writer
+            .prepare_checkpoint(&directory)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            (position.seq(), position.segment(), position.offset()),
+            (seq, seq + 1, 32)
+        );
+        assert_eq!(writer.storage_bytes(), 85);
+        assert_eq!(
+            crate::wal::storage::measure(&directory.path(Area::Wal)).ok(),
+            Some(85)
+        );
+        assert!(writer.checkpoint().is_ok());
+        assert_eq!(writer.storage_bytes(), 32);
+        assert_eq!(writer.wal_bytes(), 32);
+        assert!(!writer.needs_rotation());
+        assert_eq!(
+            crate::wal::storage::measure(&directory.path(Area::Wal)).ok(),
+            Some(32)
+        );
+    }
+}
+
+#[test]
+fn oversized_record_rejection_preserves_empty_writer() {
+    let (_temporary, directory, config) = database("wal-writer-oversized", 100, 100);
+    let mut writer =
+        WalWriter::create(&directory, config, 0, 0, 1).unwrap_or_else(|_| unreachable!());
+    assert_eq!(
+        writer
+            .append_requires_checkpoint(&maximum_record())
+            .err()
+            .map(|error| error.kind()),
+        Some(ErrorKind::ResourceExhausted)
+    );
+    assert_eq!(writer.storage_bytes(), 32);
+    assert_eq!(writer.durable_position().seq(), 0);
+    assert!(writer.append(&drop_record(1)).is_ok());
+}
+
+#[test]
+fn empty_checkpoint_preparation_is_idempotent() {
+    let (_temporary, directory, config) = database("wal-writer-empty-checkpoint", 85, 85);
+    let mut writer =
+        WalWriter::create(&directory, config, 0, 0, 1).unwrap_or_else(|_| unreachable!());
+    let initial = writer.durable_position();
+    for _ in 0..3 {
+        assert_eq!(writer.prepare_checkpoint(&directory).ok(), Some(initial));
+        assert_eq!(writer.storage_bytes(), 32);
+    }
+}
+
+#[test]
+fn frozen_empty_segment_replacement_reclaims_old_inode() {
+    let (_temporary, directory, config) = database("wal-writer-frozen-empty", 100, 100);
+    let mut writer =
+        WalWriter::create(&directory, config, 0, 0, 1).unwrap_or_else(|_| unreachable!());
+    assert!(writer.file.write_all(&[0xab; 12]).is_ok());
+    let wal_directory = directory.path(Area::Wal);
+    assert!(crate::wal::storage::preserve(&wal_directory, 1, 32, 1).is_ok());
+    let original = std::fs::read_dir(wal_directory.join("damaged"))
+        .unwrap_or_else(|_| unreachable!())
+        .next()
+        .unwrap_or_else(|| unreachable!())
+        .unwrap_or_else(|_| unreachable!())
+        .path();
+    let original_bytes = std::fs::read(&original).unwrap_or_else(|_| unreachable!());
+    writer.needs_rotation = true;
+    writer.storage_bytes = 44;
+    writer.file = File::open(directory.file(Area::Wal, "00000000000000000001.wal"))
+        .unwrap_or_else(|_| unreachable!());
+    assert!(writer.prepare_checkpoint(&directory).is_ok());
+    assert_eq!(std::fs::read(&original).ok(), Some(original_bytes));
+    assert_eq!(writer.storage_bytes(), 76);
+    assert!(writer.checkpoint().is_ok());
+    assert_eq!(
+        writer.append_requires_checkpoint(&drop_record(1)).ok(),
+        Some(false)
+    );
+    assert!(writer.append(&drop_record(1)).is_ok());
+    assert_eq!(writer.storage_bytes(), 53);
+    assert!(!original.exists());
 }
 
 #[test]

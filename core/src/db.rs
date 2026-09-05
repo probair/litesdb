@@ -116,7 +116,10 @@ impl Db {
             options,
         };
         let recovery_seal = finalize_open(&database, options.takeover)?;
-        let wal_bytes = database.lock_engine()?.writer.wal_bytes();
+        let (wal_bytes, wal_storage_bytes) = {
+            let engine = database.lock_engine()?;
+            (engine.writer.wal_bytes(), engine.writer.storage_bytes())
+        };
         let report = OpenReport {
             elapsed: started.elapsed(),
             replayed_records: opened.replayed_records,
@@ -125,6 +128,7 @@ impl Db {
             recovery_checkpointed_records: recovery_seal.checkpointed_records(),
             recovery_unit_id: recovery_seal.unit_id(),
             wal_bytes,
+            wal_storage_bytes,
         };
         Ok((database, report))
     }
@@ -237,6 +241,7 @@ impl Db {
             seal_due_in,
             unsynced_bytes,
             wal_bytes: engine.writer.wal_bytes(),
+            wal_storage_bytes: engine.writer.storage_bytes(),
             tail_bytes,
             visible_seq: engine.tail.next_seq().saturating_sub(1),
             durable_seq: engine.writer.durable_position().seq(),
@@ -284,9 +289,13 @@ impl Db {
     }
 
     fn mutate_locked(&self, engine: &mut Engine, body: &RecordBody) -> Result<Seq> {
+        engine.writer.ensure_healthy()?;
         lifecycle_gc::reap(&self.directory, &mut engine.garbage);
         let seq = engine.tail.next_seq();
         engine.tail.validate(seq, body).map_err(caller_error)?;
+        if engine.writer.append_requires_checkpoint(body)? {
+            self.seal_locked(engine)?;
+        }
         let outcome = engine.writer.append(body)?;
         if outcome.seq() != seq {
             return Err(Error::corruption(
@@ -352,3 +361,7 @@ mod fault_tests;
 #[cfg(test)]
 #[path = "lifecycle_matrix_tests.rs"]
 mod matrix_tests;
+
+#[cfg(test)]
+#[path = "bounded_wal_tests.rs"]
+mod bounded_wal_tests;

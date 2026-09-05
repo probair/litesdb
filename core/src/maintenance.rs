@@ -88,17 +88,18 @@ impl RetentionReport {
 impl Db {
     pub fn seal(&self) -> Result<SealReport> {
         let mut engine = self.lock_engine()?;
+        self.seal_locked(&mut engine)
+    }
+
+    pub(crate) fn seal_locked(&self, engine: &mut crate::db::Engine) -> Result<SealReport> {
+        engine.writer.ensure_healthy()?;
         lifecycle_gc::reap(&self.directory, &mut engine.garbage);
         let start_seq = engine.manifest.checkpoint().next_seq();
         let end_seq = engine.tail.next_seq();
-        if start_seq == end_seq {
+        if start_seq == end_seq && !engine.writer.needs_rotation() {
             return Ok(SealReport::default());
         }
-        let durable = if engine.writer.unsynced_bytes() == 0 {
-            engine.writer.durable_position()
-        } else {
-            engine.writer.sync()?
-        };
+        let durable = engine.writer.prepare_checkpoint(&self.directory)?;
         engine.last_sync = std::time::Instant::now();
         let checkpoint = Checkpoint::new(durable.segment(), durable.offset(), end_seq)?;
         let has_rows = engine
@@ -127,18 +128,21 @@ impl Db {
             &self.directory.path(Area::Units),
             next.units(),
         )?);
-        manifest::publish(
+        let tail = Arc::new(next.replay_target()?);
+        if let Err(error) = manifest::publish(
             &self.directory,
             Some(engine.manifest.identity().generation()),
             &next,
-        )?;
-        let tail = Arc::new(next.replay_target()?);
+        ) {
+            engine.writer.mark_poisoned();
+            return Err(error);
+        }
         engine.manifest = next;
         engine.tail = tail;
         engine.source = source;
         engine.maintenance_due = false;
         engine.last_seal = std::time::Instant::now();
-        self.refresh_visible(&engine);
+        self.refresh_visible(engine);
         engine.writer.checkpoint()?;
         Ok(SealReport {
             unit_id,

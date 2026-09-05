@@ -14,6 +14,7 @@ pub struct OpenReport {
     pub(crate) recovery_checkpointed_records: u64,
     pub(crate) recovery_unit_id: Option<u64>,
     pub(crate) wal_bytes: u64,
+    pub(crate) wal_storage_bytes: u64,
 }
 
 impl OpenReport {
@@ -51,6 +52,11 @@ impl OpenReport {
     pub const fn wal_bytes(self) -> u64 {
         self.wal_bytes
     }
+
+    #[must_use]
+    pub const fn wal_storage_bytes(self) -> u64 {
+        self.wal_storage_bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,6 +67,7 @@ pub struct MaintenanceStatus {
     pub(crate) seal_due_in: Option<Duration>,
     pub(crate) unsynced_bytes: u64,
     pub(crate) wal_bytes: u64,
+    pub(crate) wal_storage_bytes: u64,
     pub(crate) tail_bytes: u64,
     pub(crate) visible_seq: u64,
     pub(crate) durable_seq: u64,
@@ -98,6 +105,11 @@ impl MaintenanceStatus {
     #[must_use]
     pub const fn wal_bytes(self) -> u64 {
         self.wal_bytes
+    }
+
+    #[must_use]
+    pub const fn wal_storage_bytes(self) -> u64 {
+        self.wal_storage_bytes
     }
 
     #[must_use]

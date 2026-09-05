@@ -75,29 +75,33 @@ impl SectionBuffer {
         if rows > usize::try_from(MAX_SECTION_ROWS).unwrap_or(usize::MAX) {
             return Ok(false);
         }
-        let added = columns
-            .iter()
-            .filter(|column| {
-                !self
-                    .columns
-                    .contains_key(&(column.series(), column.field()))
-            })
-            .count();
+        let (added, added_facts) = columns.iter().try_fold(
+            (0_usize, 0_usize),
+            |(streams, facts), column| -> Result<_> {
+                let present = column
+                    .cells()
+                    .get(row)
+                    .ok_or_else(|| Error::corruption("compaction", "decoded row is absent"))?
+                    .is_some();
+                let new_stream = present
+                    && !self
+                        .columns
+                        .contains_key(&(column.series(), column.field()));
+                Ok((
+                    streams
+                        .checked_add(usize::from(new_stream))
+                        .ok_or_else(operation_limit)?,
+                    facts
+                        .checked_add(usize::from(present))
+                        .ok_or_else(operation_limit)?,
+                ))
+            },
+        )?;
         let streams = self
             .columns
             .len()
             .checked_add(added)
             .ok_or_else(operation_limit)?;
-        let added_facts = columns.iter().try_fold(0_usize, |count, column| {
-            let present = column
-                .cells()
-                .get(row)
-                .ok_or_else(|| Error::corruption("compaction", "decoded row is absent"))?
-                .is_some();
-            count
-                .checked_add(usize::from(present))
-                .ok_or_else(operation_limit)
-        })?;
         let facts = self
             .facts
             .checked_add(added_facts)
@@ -156,7 +160,7 @@ impl SectionBuffer {
                     .last_mut()
                     .ok_or_else(|| Error::corruption("compaction", "new row is absent"))?;
                 *target = cell;
-            } else {
+            } else if cell.is_some() {
                 let mut cells = vec![None; previous_rows];
                 cells.push(cell);
                 self.columns.insert(

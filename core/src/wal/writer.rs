@@ -9,7 +9,7 @@
 )]
 
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
@@ -21,7 +21,8 @@ use crate::{
         RecordBody,
         record::{self},
         recover::RecoveryOutcome,
-        segment::{SEGMENT_HEADER_BYTES, SegmentHeader, parse_segment_name, segment_name},
+        segment::{SEGMENT_HEADER_BYTES, SegmentHeader, segment_name},
+        storage,
     },
 };
 
@@ -29,6 +30,8 @@ use crate::{
 mod writer_config;
 #[path = "writer_epoch.rs"]
 mod writer_epoch;
+#[path = "writer_storage.rs"]
+mod writer_storage;
 
 pub(crate) use writer_config::WriterConfig;
 
@@ -130,6 +133,9 @@ pub(crate) struct WalWriter<I = SystemWalIo> {
     next_seq: u64,
     last_seq: u64,
     wal_bytes: u64,
+    storage_bytes: u64,
+    needs_rotation: bool,
+    recovery_headroom: bool,
     unsynced_bytes: u64,
     durable: DurablePosition,
     poisoned: bool,
@@ -162,8 +168,15 @@ impl WalWriter<SystemWalIo> {
     ) -> Result<Self> {
         let wal_directory = directory.path(Area::Wal);
         let path = wal_directory.join(segment_name(recovery.active_segment()));
-        let mut file = OpenOptions::new().read(true).append(true).open(path)?;
-        if file.metadata()?.len() != recovery.active_offset() {
+        let needs_rotation = recovery.needs_rotation();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(!needs_rotation)
+            .open(path)?;
+        let physical_len = file.metadata()?.len();
+        if physical_len < recovery.active_offset()
+            || (!needs_rotation && physical_len != recovery.active_offset())
+        {
             return Err(Error::corruption(
                 "WAL resume",
                 "active file length changed after recovery",
@@ -196,6 +209,9 @@ impl WalWriter<SystemWalIo> {
             next_seq: recovery.next_seq(),
             last_seq,
             wal_bytes: recovery.wal_bytes(),
+            storage_bytes: recovery.storage_bytes(),
+            needs_rotation,
+            recovery_headroom: true,
             unsynced_bytes: 0,
             durable: DurablePosition {
                 seq: last_seq,
@@ -220,6 +236,11 @@ impl<I: WalIo> WalWriter<I> {
             return Err(Error::invalid("next_seq", "WAL sequence starts at one"));
         }
         let wal_directory = directory.path(Area::Wal);
+        let storage_bytes = storage::reclaim(
+            &wal_directory,
+            SEGMENT_HEADER_BYTES as u64,
+            u64::from(config.wal_limit),
+        )?;
         let path = wal_directory.join(segment_name(next_seq));
         let mut file = io.create_segment(&path)?;
         let header = SegmentHeader::new(next_seq, shard_id, writer_epoch).encode();
@@ -244,6 +265,11 @@ impl<I: WalIo> WalWriter<I> {
             next_seq,
             last_seq,
             wal_bytes: offset,
+            storage_bytes: storage_bytes.checked_add(offset).ok_or_else(|| {
+                Error::limit("wal_storage_bytes", u64::MAX, u64::from(config.wal_limit))
+            })?,
+            needs_rotation: false,
+            recovery_headroom: false,
             unsynced_bytes: 0,
             durable: DurablePosition {
                 seq: last_seq,
@@ -263,6 +289,14 @@ impl<I: WalIo> WalWriter<I> {
         let frame = record::encode(self.next_seq, body)?;
         let frame_bytes = u64::try_from(frame.len())
             .map_err(|_| Error::limit("wal_record_bytes", u64::MAX, u64::MAX))?;
+        if self.frame_requires_checkpoint(frame_bytes)? {
+            return Err(Error::limit(
+                "wal_storage_bytes",
+                self.storage_bytes
+                    .saturating_add(self.append_growth(frame_bytes)?),
+                u64::from(self.config.wal_limit),
+            ));
+        }
         let segment_end = self
             .offset
             .checked_add(frame_bytes)
@@ -279,14 +313,6 @@ impl<I: WalIo> WalWriter<I> {
             .checked_add(header_bytes)
             .and_then(|bytes| bytes.checked_add(frame_bytes))
             .ok_or_else(|| Error::limit("wal_bytes", u64::MAX, u64::from(self.config.wal_limit)))?;
-        if next_wal_bytes > u64::from(self.config.wal_limit) {
-            return Err(Error::limit(
-                "wal_bytes",
-                next_wal_bytes,
-                u64::from(self.config.wal_limit),
-            ));
-        }
-
         if rolls {
             self.roll_segment(self.next_seq)?;
         }
@@ -302,6 +328,13 @@ impl<I: WalIo> WalWriter<I> {
             .checked_add(frame_bytes)
             .ok_or_else(|| Error::limit("wal_segment_bytes", u64::MAX, u64::from(u32::MAX)))?;
         self.wal_bytes = next_wal_bytes;
+        self.storage_bytes = self.storage_bytes.checked_add(frame_bytes).ok_or_else(|| {
+            Error::limit(
+                "wal_storage_bytes",
+                u64::MAX,
+                u64::from(self.config.wal_limit),
+            )
+        })?;
         self.unsynced_bytes = self
             .unsynced_bytes
             .checked_add(frame_bytes)
@@ -335,32 +368,12 @@ impl<I: WalIo> WalWriter<I> {
         Ok(self.durable)
     }
 
-    pub(crate) fn checkpoint(&mut self) -> Result<()> {
-        self.ensure_healthy()?;
-        let mut removed = false;
-        for entry in fs::read_dir(&self.wal_directory)? {
-            let entry = entry?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| Error::corruption("WAL directory", "file name is not UTF-8"))?;
-            let first_seq = parse_segment_name(&name)?;
-            if first_seq < self.segment_first_seq {
-                fs::remove_file(entry.path())?;
-                removed = true;
-            }
-        }
-        if removed {
-            self.io
-                .sync_directory(IoStep::WalDirectorySync, &self.wal_directory)?;
-        }
-        self.wal_bytes = u64::try_from(SEGMENT_HEADER_BYTES)
-            .map_err(|_| Error::limit("wal_bytes", u64::MAX, u64::from(self.config.wal_limit)))?;
-        self.unsynced_bytes = 0;
-        Ok(())
+    fn roll_segment(&mut self, first_seq: u64) -> Result<()> {
+        self.roll_segment_with_headroom(first_seq, false)
     }
 
-    fn roll_segment(&mut self, first_seq: u64) -> Result<()> {
+    fn roll_segment_with_headroom(&mut self, first_seq: u64, recovery: bool) -> Result<()> {
+        self.reserve_transition_header(recovery)?;
         if self
             .io
             .sync_data(IoStep::RollOldDataSync, &self.file)
@@ -398,6 +411,14 @@ impl<I: WalIo> WalWriter<I> {
             .wal_bytes
             .checked_add(self.offset)
             .ok_or_else(|| Error::limit("wal_bytes", u64::MAX, u64::from(self.config.wal_limit)))?;
+        self.storage_bytes = self.storage_bytes.checked_add(self.offset).ok_or_else(|| {
+            Error::limit(
+                "wal_storage_bytes",
+                u64::MAX,
+                u64::from(self.config.wal_limit),
+            )
+        })?;
+        self.needs_rotation = false;
         self.unsynced_bytes = 0;
         Ok(())
     }

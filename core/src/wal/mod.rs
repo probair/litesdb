@@ -6,6 +6,7 @@
 mod record;
 mod recover;
 mod segment;
+pub(crate) mod storage;
 mod tail;
 mod tail_validate;
 mod writer;

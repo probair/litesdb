@@ -256,7 +256,14 @@ fn takeover_capacity_is_recovered_before_identity_changes() {
         wal_max_bytes: 185,
         ..OpenOptions::default()
     };
-    let database = Db::open(root.path(), options).unwrap_or_else(|_| unreachable!("open"));
+    let database = Db::open(
+        root.path(),
+        OpenOptions {
+            wal_max_bytes: 512,
+            ..options
+        },
+    )
+    .unwrap_or_else(|_| unreachable!("open"));
     let table = database
         .create_table(spec())
         .unwrap_or_else(|_| unreachable!("create"));
@@ -283,7 +290,8 @@ fn takeover_capacity_is_recovered_before_identity_changes() {
     .unwrap_or_else(|_| unreachable!("capacity-normalized takeover"));
     assert_eq!(report.recovery_checkpointed_records(), 3);
     assert_eq!(report.recovery_unit_id(), Some(1));
-    assert_eq!(report.wal_bytes(), 64);
+    assert_eq!(report.wal_bytes(), 32);
+    assert_eq!(report.wal_storage_bytes(), 32);
     let after = manifest::load(&directory(root.path())).unwrap_or_else(|_| unreachable!());
     assert_eq!(
         after.identity().generation(),
@@ -303,7 +311,7 @@ fn takeover_capacity_is_recovered_before_identity_changes() {
         }])
     );
     drop(database);
-    assert_eq!(segment_epochs(root.path()), vec![0, 1]);
+    assert_eq!(segment_epochs(root.path()), vec![1]);
 }
 
 #[test]
@@ -315,7 +323,7 @@ fn open_seals_recovered_wal_that_exceeds_the_new_runtime_policy() {
             bytes: 90,
             ..SealPolicy::default()
         },
-        wal_max_bytes: 185,
+        wal_max_bytes: 512,
         ..OpenOptions::default()
     };
     let database = Db::open(root.path(), original).unwrap_or_else(|_| unreachable!("open"));
@@ -389,7 +397,8 @@ fn metadata_only_takeover_checkpoints_without_creating_a_unit() {
     .unwrap_or_else(|_| unreachable!("metadata takeover"));
     assert_eq!(report.recovery_checkpointed_records(), 1);
     assert_eq!(report.recovery_unit_id(), None);
-    assert_eq!(report.wal_bytes(), 64);
+    assert_eq!(report.wal_bytes(), 32);
+    assert_eq!(report.wal_storage_bytes(), 32);
     let after = manifest::load(&directory(root.path())).unwrap_or_else(|_| unreachable!());
     assert_eq!(
         after.identity().generation(),
@@ -415,7 +424,14 @@ fn full_wal_completes_an_already_published_epoch_after_recovery_seal() {
         wal_max_bytes: 185,
         ..OpenOptions::default()
     };
-    let database = Db::open(root.path(), options).unwrap_or_else(|_| unreachable!("open"));
+    let database = Db::open(
+        root.path(),
+        OpenOptions {
+            wal_max_bytes: 512,
+            ..options
+        },
+    )
+    .unwrap_or_else(|_| unreachable!("open"));
     let table = database
         .create_table(spec())
         .unwrap_or_else(|_| unreachable!("create"));
@@ -442,7 +458,8 @@ fn full_wal_completes_an_already_published_epoch_after_recovery_seal() {
         .unwrap_or_else(|_| unreachable!("complete interrupted takeover"));
     assert_eq!(report.recovery_checkpointed_records(), 3);
     assert_eq!(report.recovery_unit_id(), Some(1));
-    assert_eq!(report.wal_bytes(), 64);
+    assert_eq!(report.wal_bytes(), 32);
+    assert_eq!(report.wal_storage_bytes(), 32);
     let after = manifest::load(&directory).unwrap_or_else(|_| unreachable!("manifest"));
     assert_eq!(
         after.identity().generation(),
@@ -453,5 +470,5 @@ fn full_wal_completes_an_already_published_epoch_after_recovery_seal() {
         published.identity().writer_epoch()
     );
     drop(database);
-    assert_eq!(segment_epochs(root.path()), vec![0, 1]);
+    assert_eq!(segment_epochs(root.path()), vec![1]);
 }

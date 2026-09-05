@@ -118,7 +118,7 @@ fn repeated_reopen_is_deterministic() {
 }
 
 #[test]
-fn every_final_record_tear_is_durably_truncated() {
+fn every_final_record_tear_preserves_the_original() {
     let first = record::encode(1, &create_table(1)).unwrap_or_else(|_| unreachable!());
     let second = record::encode(2, &observation(10)).unwrap_or_else(|_| unreachable!());
     let header = SegmentHeader::new(1, 0, 0).encode();
@@ -138,7 +138,11 @@ fn every_final_record_tear_is_durably_truncated() {
             fs::metadata(directory.file(Area::Wal, &segment_name(1)))
                 .unwrap_or_else(|_| unreachable!())
                 .len(),
-            u64::try_from(complete_prefix).unwrap_or(u64::MAX)
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+        );
+        assert_eq!(
+            fs::read(directory.file(Area::Wal, &segment_name(1))).ok(),
+            Some(bytes)
         );
         assert_repaired_state_is_stable(
             &directory,

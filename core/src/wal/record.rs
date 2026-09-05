@@ -118,6 +118,10 @@ pub(crate) fn encode(seq: u64, body: &RecordBody) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
+pub(crate) fn encoded_len(body: &RecordBody) -> Result<u32> {
+    frame_len_from_payload(measure_payload(body)?)
+}
+
 pub(crate) fn framed_len(prefix: &[u8]) -> Result<usize> {
     decode_impl::framed_len(prefix)
 }
