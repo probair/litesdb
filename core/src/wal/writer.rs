@@ -10,13 +10,13 @@
 
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
 use crate::{
     Error, Result,
-    fsutil::{Area, DbDir, sync_directory},
+    fsutil::{Area, DbDir},
     wal::{
         RecordBody,
         record::{self},
@@ -25,6 +25,13 @@ use crate::{
         storage,
     },
 };
+
+#[cfg(feature = "archive")]
+#[path = "writer_archive.rs"]
+mod writer_archive;
+
+#[path = "writer_io.rs"]
+mod writer_io;
 
 #[path = "writer_config.rs"]
 mod writer_config;
@@ -98,27 +105,6 @@ pub(crate) trait WalIo {
 #[derive(Debug, Default)]
 pub(crate) struct SystemWalIo;
 
-impl WalIo for SystemWalIo {
-    fn create_segment(&mut self, path: &Path) -> io::Result<File> {
-        OpenOptions::new().write(true).create_new(true).open(path)
-    }
-
-    fn write_all(&mut self, _step: IoStep, file: &mut File, bytes: &[u8]) -> io::Result<()> {
-        file.write_all(bytes)
-    }
-
-    fn sync_data(&mut self, _step: IoStep, file: &File) -> io::Result<()> {
-        file.sync_data()
-    }
-
-    fn sync_directory(&mut self, _step: IoStep, path: &Path) -> io::Result<()> {
-        sync_directory(path).map_err(|error| match error {
-            Error::Io(source) => source,
-            _ => io::Error::other("unexpected directory synchronization error"),
-        })
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct WalWriter<I = SystemWalIo> {
     io: I,
@@ -139,6 +125,8 @@ pub(crate) struct WalWriter<I = SystemWalIo> {
     unsynced_bytes: u64,
     durable: DurablePosition,
     poisoned: bool,
+    #[cfg(feature = "archive")]
+    archive: Option<crate::archive::ArchiveStore>,
 }
 
 impl WalWriter<SystemWalIo> {
@@ -219,6 +207,8 @@ impl WalWriter<SystemWalIo> {
                 offset: recovery.active_offset(),
             },
             poisoned: false,
+            #[cfg(feature = "archive")]
+            archive: None,
         })
     }
 }
@@ -277,6 +267,8 @@ impl<I: WalIo> WalWriter<I> {
                 offset,
             },
             poisoned: false,
+            #[cfg(feature = "archive")]
+            archive: None,
         })
     }
 
@@ -316,6 +308,13 @@ impl<I: WalIo> WalWriter<I> {
         if rolls {
             self.roll_segment(self.next_seq)?;
         }
+        #[cfg(feature = "archive")]
+        self.archive_stage(
+            self.offset
+                .checked_add(frame_bytes)
+                .ok_or_else(|| Error::corruption("archive", "position overflow"))?,
+            &frame,
+        )?;
         if self
             .io
             .write_all(IoStep::RecordWrite, &mut self.file, &frame)
@@ -359,6 +358,8 @@ impl<I: WalIo> WalWriter<I> {
         {
             return self.poison();
         }
+        #[cfg(feature = "archive")]
+        self.archive_commit()?;
         self.durable = DurablePosition {
             seq: self.last_seq,
             segment: self.segment_first_seq,
@@ -381,6 +382,8 @@ impl<I: WalIo> WalWriter<I> {
         {
             return self.poison();
         }
+        #[cfg(feature = "archive")]
+        self.archive_commit()?;
         self.durable = DurablePosition {
             seq: self.last_seq,
             segment: self.segment_first_seq,

@@ -74,17 +74,56 @@ impl Db {
     }
 
     pub fn open_with_report(root: &Path, options: OpenOptions) -> Result<(Self, OpenReport)> {
+        Self::open_configured(
+            root,
+            options,
+            #[cfg(feature = "archive")]
+            None,
+            #[cfg(feature = "archive")]
+            false,
+        )
+    }
+
+    pub(crate) fn open_configured(
+        root: &Path,
+        options: OpenOptions,
+        #[cfg(feature = "archive")] archive_options: Option<crate::archive::ArchiveOptions>,
+        #[cfg(feature = "archive")] restoring: bool,
+    ) -> Result<(Self, OpenReport)> {
+        #[cfg(feature = "archive")]
+        let archive_requested = archive_options.is_some();
+        #[cfg(not(feature = "archive"))]
+        let archive_requested = false;
+        #[cfg(feature = "archive")]
+        if let Some(options) = archive_options {
+            options.validate()?;
+        }
+        #[cfg(not(feature = "archive"))]
+        let restoring = false;
+        crate::db_open::ensure_open_mode(root, archive_requested, restoring)?;
         let started = Instant::now();
         let config = validate(options)?;
         fs::create_dir_all(root)?;
         let lock = Arc::new(DbLock::acquire(root)?);
         let directory = Arc::new(DbDir::initialize(root)?);
         directory.clear_temporary()?;
+        #[cfg(feature = "archive")]
+        let loaded_archive = crate::archive::preflight(&directory, archive_options)?;
         let manifest_path = directory.file(Area::Root, "MANIFEST");
         let opened = if manifest_path.try_exists()? {
-            open_existing(&directory, config)?
+            open_existing(&directory, config, options.directory_cache_bytes)?
         } else {
-            initialize_new(&directory, config)?
+            initialize_new(&directory, config, options.directory_cache_bytes)?
+        };
+        #[cfg(feature = "archive")]
+        let opened = {
+            let mut opened = opened;
+            if let Some(options) = archive_options {
+                opened
+                    .writer
+                    .attach_archive(&directory, options, loaded_archive)?;
+            }
+            opened
         };
         let tail = Arc::new(opened.tail);
         let source = Arc::new(opened.source);
@@ -242,6 +281,7 @@ impl Db {
             unsynced_bytes,
             wal_bytes: engine.writer.wal_bytes(),
             wal_storage_bytes: engine.writer.storage_bytes(),
+            directory_cache_bytes: engine.source.directory_cache_bytes()?,
             tail_bytes,
             visible_seq: engine.tail.next_seq().saturating_sub(1),
             durable_seq: engine.writer.durable_position().seq(),
@@ -365,3 +405,7 @@ mod matrix_tests;
 #[cfg(test)]
 #[path = "bounded_wal_tests.rs"]
 mod bounded_wal_tests;
+
+#[cfg(feature = "archive")]
+#[path = "db_archive.rs"]
+mod archive_support;

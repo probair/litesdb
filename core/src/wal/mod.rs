@@ -3,9 +3,9 @@
 // This file is part of LiteSDB. See LICENSE for license details.
 // Project: https://github.com/probair/litesdb
 
-mod record;
+pub(crate) mod record;
 mod recover;
-mod segment;
+pub(crate) mod segment;
 pub(crate) mod storage;
 mod tail;
 mod tail_validate;

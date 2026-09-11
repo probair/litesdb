@@ -67,7 +67,7 @@ fn source_uses_the_bounded_directory_lru() {
     write_artifact(&root, &first.0, first.1);
     write_artifact(&root, &second.0, second.1);
 
-    let source = FileUnitSource::open_with_budget(&root, &[first.1, second.1], 256)
+    let source = FileUnitSource::open(&root, &[first.1, second.1], 256)
         .unwrap_or_else(|_| unreachable!("source open failed"));
     assert_eq!(source.cache_usage().ok(), Some((0, 0)));
     assert_eq!(
@@ -92,7 +92,7 @@ fn body_corruption_is_rejected_on_first_section_read() {
     fs::create_dir_all(&root).unwrap_or_else(|_| unreachable!("fixture directory failed"));
     let (bytes, meta, entry) = artifact(1, 10);
     write_artifact(&root, &bytes, meta);
-    let source = FileUnitSource::open(&root, &[meta])
+    let source = FileUnitSource::open(&root, &[meta], crate::limits::DEFAULT_DIRECTORY_CACHE_BYTES)
         .unwrap_or_else(|_| unreachable!("clean source open failed"));
 
     let mut file = OpenOptions::new()

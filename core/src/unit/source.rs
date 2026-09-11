@@ -8,14 +8,14 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use crc32fast::Hasher;
 
 use crate::{
     Error, Result, TableId,
-    limits::{DEFAULT_DIRECTORY_CACHE_BYTES, SECTION_WORKING_MEMORY_BYTES},
+    limits::SECTION_WORKING_MEMORY_BYTES,
     manifest::UnitMeta,
     unit::{DirectoryCache, TableDirectoryEntry, format},
 };
@@ -37,15 +37,27 @@ enum Integrity {
 
 pub(crate) struct FileUnitSource {
     units: BTreeMap<u64, FileUnit>,
-    directories: Mutex<DirectoryCache>,
+    directories: Arc<Mutex<DirectoryCache>>,
 }
 
 impl FileUnitSource {
-    pub(crate) fn open(root: &Path, units: &[UnitMeta]) -> Result<Self> {
-        Self::open_with_budget(root, units, DEFAULT_DIRECTORY_CACHE_BYTES)
+    pub(crate) fn open(root: &Path, units: &[UnitMeta], budget: u32) -> Result<Self> {
+        Self::with_cache(
+            root,
+            units,
+            Arc::new(Mutex::new(DirectoryCache::new(budget)?)),
+        )
     }
 
-    fn open_with_budget(root: &Path, units: &[UnitMeta], budget: u32) -> Result<Self> {
+    pub(crate) fn reopen(&self, root: &Path, units: &[UnitMeta]) -> Result<Self> {
+        Self::with_cache(root, units, Arc::clone(&self.directories))
+    }
+
+    fn with_cache(
+        root: &Path,
+        units: &[UnitMeta],
+        directories: Arc<Mutex<DirectoryCache>>,
+    ) -> Result<Self> {
         let mut loaded = BTreeMap::new();
         for unit in units {
             let path = root.join(format::unit_name(unit.unit_id()));
@@ -67,7 +79,7 @@ impl FileUnitSource {
         }
         Ok(Self {
             units: loaded,
-            directories: Mutex::new(DirectoryCache::new(budget)?),
+            directories,
         })
     }
 }
@@ -148,6 +160,19 @@ impl FileUnitSource {
 
     fn lock_directories(&self) -> Result<MutexGuard<'_, DirectoryCache>> {
         self.directories.lock().map_err(|_| Error::Poisoned)
+    }
+
+    #[cfg(feature = "archive")]
+    pub(crate) fn validate_all(&self) -> Result<()> {
+        for unit in self.units.values() {
+            load_directory(&unit.path, unit.meta)?;
+            ensure_body_integrity(unit)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn directory_cache_bytes(&self) -> Result<u64> {
+        Ok(self.lock_directories()?.used_bytes())
     }
 
     #[cfg(test)]

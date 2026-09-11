@@ -118,6 +118,14 @@ impl Snapshot {
         )
     }
 
+    pub fn table_last_timestamp(&self, table: TableId) -> Result<Option<i64>> {
+        self.state
+            .tail
+            .table(table)
+            .map(crate::wal::TailTable::last_ts)
+            .ok_or_else(|| Error::invalid("table", "table is absent"))
+    }
+
     pub fn table_versions(&self, table: TableId) -> Result<&[TableVersion]> {
         self.state
             .tail

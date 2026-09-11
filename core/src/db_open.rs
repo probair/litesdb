@@ -27,9 +27,17 @@ pub(crate) struct Opened {
     pub(crate) repaired_bytes: u64,
 }
 
-pub(crate) fn open_existing(directory: &DbDir, config: WriterConfig) -> Result<Opened> {
+pub(crate) fn open_existing(
+    directory: &DbDir,
+    config: WriterConfig,
+    directory_cache_bytes: u32,
+) -> Result<Opened> {
     let catalog = manifest::load(directory)?;
-    let source = FileUnitSource::open(&directory.path(Area::Units), catalog.units())?;
+    let source = FileUnitSource::open(
+        &directory.path(Area::Units),
+        catalog.units(),
+        directory_cache_bytes,
+    )?;
     let heads = load_heads(directory, &catalog)?;
     let mut tail = catalog.replay_target()?;
     let identity = catalog.identity();
@@ -60,14 +68,18 @@ pub(crate) fn open_existing(directory: &DbDir, config: WriterConfig) -> Result<O
     })
 }
 
-pub(crate) fn initialize_new(directory: &DbDir, config: WriterConfig) -> Result<Opened> {
+pub(crate) fn initialize_new(
+    directory: &DbDir,
+    config: WriterConfig,
+    directory_cache_bytes: u32,
+) -> Result<Opened> {
     clear_unowned_areas(directory)?;
     let mut writer = WalWriter::create(directory, config, 0, 0, 1)?;
     let durable = writer.sync()?;
     let checkpoint = Checkpoint::new(durable.segment(), durable.offset(), 1)?;
     let catalog = Manifest::initial(checkpoint)?;
     manifest::publish(directory, None, &catalog)?;
-    let source = FileUnitSource::open(&directory.path(Area::Units), &[])?;
+    let source = FileUnitSource::open(&directory.path(Area::Units), &[], directory_cache_bytes)?;
     Ok(Opened {
         catalog,
         tail: TailIndex::new(0, 1),
@@ -189,6 +201,28 @@ fn clear_unowned_areas(directory: &DbDir) -> Result<()> {
             }
         }
         directory.sync(area)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_open_mode(
+    root: &std::path::Path,
+    archive_requested: bool,
+    restoring: bool,
+) -> Result<()> {
+    if !archive_requested
+        && (root.join("ARCHIVE").try_exists()? || root.join("archive").try_exists()?)
+    {
+        return Err(Error::unsupported(
+            "open",
+            "database requires archive-enabled open",
+        ));
+    }
+    if !restoring && root.join("RESTORE-WORK").try_exists()? {
+        return Err(Error::unsupported(
+            "open",
+            "database is an unfinished restore generation",
+        ));
     }
     Ok(())
 }

@@ -61,6 +61,7 @@ impl OpenReport {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MaintenanceStatus {
+    pub(crate) directory_cache_bytes: u64,
     pub(crate) sync_due: bool,
     pub(crate) seal_due: bool,
     pub(crate) sync_due_in: Option<Duration>,
@@ -77,6 +78,11 @@ pub struct MaintenanceStatus {
 }
 
 impl MaintenanceStatus {
+    #[must_use]
+    pub const fn directory_cache_bytes(self) -> u64 {
+        self.directory_cache_bytes
+    }
+
     #[must_use]
     pub const fn sync_due(self) -> bool {
         self.sync_due

@@ -15,6 +15,8 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 mod agg;
+#[cfg(feature = "archive")]
+pub mod archive;
 mod codec;
 mod db;
 mod db_open;
@@ -34,6 +36,11 @@ mod unit;
 mod wal;
 
 pub use agg::{Bucket, SumResult};
+#[cfg(feature = "archive")]
+pub use archive::{
+    ArchiveCursor, ArchiveOptions, ArchiveStatus, BaseDescriptor, BaseFile, ExportChunk,
+    FrozenBase, RestoreBuilder, RestoredDbDescriptor,
+};
 pub use db::{Db, Seq};
 pub use error::{ArgDetail, CorruptionDetail, Error, ErrorKind, LimitDetail, OpDetail};
 pub use maintenance::{CompactLevel, CompactReport, RetentionReport, SealReport};
@@ -59,9 +66,16 @@ const _: fn() = assert_send_sync::<query::Snapshot>;
 mod production_contract_tests;
 
 #[cfg(test)]
+#[path = "caller_extension_tests.rs"]
+mod caller_extension_tests;
+
+#[cfg(test)]
 #[path = "takeover_tests.rs"]
 mod takeover_tests;
 
 #[cfg(test)]
 #[path = "takeover_fault_tests.rs"]
 mod takeover_fault_tests;
+
+#[cfg(test)]
+mod archive_feature_tests;

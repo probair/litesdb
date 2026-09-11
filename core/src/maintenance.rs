@@ -11,7 +11,7 @@ use crate::{
     lifecycle_gc,
     manifest::{self, RetentionState, UnitMeta},
     retention::{fold, head_name, publish_heads},
-    unit::{FileUnitSource, compact_and_publish, seal_and_publish},
+    unit::{compact_and_publish, seal_and_publish},
     wal::Checkpoint,
 };
 
@@ -124,10 +124,11 @@ impl Db {
             engine
                 .manifest
                 .successor_from_tail(checkpoint, &engine.tail, units, high_water)?;
-        let source = Arc::new(FileUnitSource::open(
-            &self.directory.path(Area::Units),
-            next.units(),
-        )?);
+        let source = Arc::new(
+            engine
+                .source
+                .reopen(&self.directory.path(Area::Units), next.units())?,
+        );
         let tail = Arc::new(next.replay_target()?);
         if let Err(error) = manifest::publish(
             &self.directory,
@@ -206,10 +207,11 @@ impl Db {
             engine
                 .manifest
                 .successor_catalog(engine.manifest.retention(), units, unit_id)?;
-        let source = Arc::new(FileUnitSource::open(
-            &self.directory.path(Area::Units),
-            next.units(),
-        )?);
+        let source = Arc::new(
+            engine
+                .source
+                .reopen(&self.directory.path(Area::Units), next.units())?,
+        );
         manifest::publish(
             &self.directory,
             Some(engine.manifest.identity().generation()),
@@ -287,10 +289,11 @@ impl Db {
             remaining,
             engine.manifest.identity().unit_high_water(),
         )?;
-        let source = Arc::new(FileUnitSource::open(
-            &self.directory.path(Area::Units),
-            next.units(),
-        )?);
+        let source = Arc::new(
+            engine
+                .source
+                .reopen(&self.directory.path(Area::Units), next.units())?,
+        );
         manifest::publish(
             &self.directory,
             Some(engine.manifest.identity().generation()),

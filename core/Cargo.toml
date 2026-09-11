@@ -15,5 +15,10 @@ version.workspace = true
 [lib]
 name = "litesdb_core"
 
+[features]
+default = []
+archive = ["dep:sha2"]
+
 [dependencies]
 crc32fast = "1"
+sha2 = { version = "0.10", optional = true }

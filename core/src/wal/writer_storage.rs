@@ -20,6 +20,8 @@ impl<I: WalIo> WalWriter<I> {
     }
 
     pub(super) fn frame_requires_checkpoint(&mut self, frame_bytes: u64) -> Result<bool> {
+        #[cfg(feature = "archive")]
+        self.archive_admit(frame_bytes)?;
         let limit = u64::from(self.config.wal_limit);
         let minimum = frame_bytes
             .checked_add(SEGMENT_HEADER_BYTES as u64)
@@ -98,6 +100,8 @@ impl<I: WalIo> WalWriter<I> {
 
     pub(crate) fn checkpoint(&mut self) -> Result<()> {
         self.ensure_healthy()?;
+        #[cfg(feature = "archive")]
+        self.archive_protected()?;
         let mut removed = false;
         for entry in fs::read_dir(&self.wal_directory)? {
             let entry = entry?;
