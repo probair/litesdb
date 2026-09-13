@@ -8,6 +8,9 @@
     reason = "called by database open and publication later in M4/M6"
 )]
 
+#[cfg(feature = "bench-metrics")]
+use crate::bench_metrics::{Span, Stage};
+
 use std::{fs::File, io::Read};
 
 use crate::{
@@ -44,6 +47,8 @@ pub(crate) fn publish(
     previous_generation: Option<u64>,
     manifest: &Manifest,
 ) -> Result<()> {
+    #[cfg(feature = "bench-metrics")]
+    let _profile = Span::new(Stage::ManifestPublish);
     let expected = match previous_generation {
         Some(previous) => previous
             .checked_add(1)

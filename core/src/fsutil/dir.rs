@@ -57,6 +57,14 @@ struct PublishFault {
 }
 
 impl DbDir {
+    pub(crate) fn existing(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            #[cfg(test)]
+            publish_fault: Mutex::new(None),
+        }
+    }
+
     pub(crate) fn initialize(root: &Path) -> Result<Self> {
         fs::create_dir_all(root)?;
         let directory = Self {

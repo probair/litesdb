@@ -9,7 +9,7 @@ use crate::{
     Result, SealPolicy, SeriesId, SyncPolicy, TableId, TableSpec, Validity, ValueType,
     fsutil::{Area, PublishStep, TestDir},
 };
-use std::{fs, time::Duration};
+use std::{fs, io::Write as _, time::Duration};
 
 fn table(db: &Db) -> Result<TableId> {
     db.create_table(TableSpec::new(
@@ -34,7 +34,6 @@ fn append(db: &Db, table: TableId, ts: i64) -> Result<()> {
 fn options() -> OpenOptions {
     OpenOptions {
         sync_policy: SyncPolicy::Manual,
-        wal_max_bytes: 512,
         seal_policy: SealPolicy {
             bytes: 200,
             interval: Duration::from_secs(3600),
@@ -79,7 +78,7 @@ fn durable_export_survives_automatic_seals_and_reopen() -> Result<()> {
 }
 
 #[test]
-fn unsynced_primary_suffix_is_reconciled_before_recovery_seal() -> Result<()> {
+fn shared_sync_rebuilds_hash_chain_without_per_database_archive_publication() -> Result<()> {
     let root = TestDir::new("archive-catchup");
     let opts = OpenOptions {
         sync_policy: SyncPolicy::Manual,
@@ -90,6 +89,9 @@ fn unsynced_primary_suffix_is_reconciled_before_recovery_seal() -> Result<()> {
     let table = table(&db)?;
     append(&db, table, 10)?;
     assert_eq!(db.archive_status()?.durable_end(), start);
+    let authority = fs::read(root.path().join("ARCHIVE"))?;
+    db.sync()?;
+    assert_eq!(fs::read(root.path().join("ARCHIVE"))?, authority);
     drop(db);
     let db = Db::open_with_archive(root.path(), options(), ArchiveOptions::default())?;
     assert_eq!(db.archive_status()?.durable_end().seq, 2);
@@ -111,10 +113,11 @@ fn torn_unsynced_primary_record_is_not_exported() -> Result<()> {
     let end = db.archive_status()?.durable_end();
     append(&db, table, 10)?;
     drop(db);
-    let wal = root.path().join("wal/00000000000000000001.wal");
-    let file = fs::OpenOptions::new().write(true).open(&wal)?;
-    file.set_len(file.metadata()?.len() - 3)?;
-    drop(file);
+    let wal = root.path().join("_shared/wal/00000000000000000001.swal");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&wal)?
+        .write_all(&[1, 2, 3])?;
     let db = Db::open_with_archive(root.path(), opts, ArchiveOptions::default())?;
     assert_eq!(db.archive_status()?.durable_end(), end);
     assert_eq!(db.snapshot().table_last_timestamp(table)?, None);
@@ -132,16 +135,21 @@ fn archive_publish_failure_preserves_primary_and_reopens_twice() -> Result<()> {
     ] {
         let root = TestDir::new("archive-publish-fault");
         let db = Db::open_with_archive(root.path(), options(), ArchiveOptions::default())?;
-        let start = db.archive_status()?.durable_end();
         let table = table(&db)?;
         append(&db, table, 10)?;
+        db.sync()?;
+        db.seal()?;
+        let end = db.archive_status()?.durable_end();
         db.directory.fail_publish(Area::Root, "ARCHIVE", step);
-        assert_eq!(db.seal().err().map(|e| e.kind()), Some(ErrorKind::Poisoned));
-        assert!(!db.archive_status()?.healthy());
+        assert!(db.release_archive(end).is_err());
+        assert_eq!(
+            db.sync().err().map(|error| error.kind()),
+            Some(ErrorKind::Poisoned)
+        );
         drop(db);
         for _ in 0..2 {
             let db = Db::open_with_archive(root.path(), options(), ArchiveOptions::default())?;
-            let chunk = db.export_durable(start, 4096)?;
+            let chunk = db.export_durable(db.archive_status()?.earliest(), 4096)?;
             assert_eq!(chunk.end().seq, 2);
             assert_eq!(db.snapshot().table_last_timestamp(table)?, Some(10));
         }

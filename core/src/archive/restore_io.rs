@@ -31,7 +31,7 @@ pub(crate) struct State {
 impl State {
     pub(crate) fn encode(self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"LSRS\x01\0\0\0");
+        bytes.extend_from_slice(b"LSRS\x02\0\0\0");
         bytes.extend_from_slice(&self.generation.to_le_bytes());
         bytes.extend_from_slice(&self.base_id);
         bytes.extend_from_slice(&self.cursor.to_bytes());
@@ -43,7 +43,7 @@ impl State {
         bytes
     }
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != 336 {
+        if bytes.len() != 368 {
             return Err(super::invalid("restore state length"));
         }
         let end = bytes.len().saturating_sub(32);
@@ -51,7 +51,7 @@ impl State {
             return Err(super::invalid("restore state digest"));
         }
         let mut reader = Reader::new(&bytes[..end]);
-        reader.magic(b"LSRS\x01\0\0\0")?;
+        reader.magic(b"LSRS\x02\0\0\0")?;
         let generation = reader.u64()?;
         let base_id = reader.array()?;
         let cursor = ArchiveCursor::from_bytes(reader.take(CURSOR_BYTES)?)?;
@@ -77,7 +77,7 @@ pub(crate) fn generation_path(root: &Path, generation: u64) -> PathBuf {
 }
 pub(crate) fn read_state(path: &Path) -> Result<State> {
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.len() != 336 {
+    if !metadata.file_type().is_file() || metadata.len() != 368 {
         return Err(super::invalid("restore state is not regular"));
     }
     State::decode(&fs::read(path)?)
@@ -121,11 +121,6 @@ pub(crate) fn clone_generation(source: &Path, target: &Path) -> Result<()> {
     fs::write(target.join("RESTORE-WORK"), [])?;
     sync_directory(target)?;
     copy_file(&source.join("MANIFEST"), &target.join("MANIFEST"))?;
-    let wal = crate::wal::segment::segment_name(manifest.checkpoint().segment_first_seq());
-    copy_file(
-        &source.join("wal").join(&wal),
-        &target.join("wal").join(wal),
-    )?;
     for unit in manifest.units() {
         let name = format!("{:016x}.lsu", unit.unit_id());
         fs::hard_link(

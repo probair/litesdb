@@ -287,8 +287,12 @@ fn incremental_restore_exceeds_twenty_five_mib_without_unbounded_wal() -> Result
         let work = Db::open_for_restore(
             &restore_io::generation_path(&target, builder.state.generation),
             options,
+            builder.state.cursor,
         )?;
-        assert!(work.maintenance_status()?.wal_storage_bytes() <= u64::from(options.wal_max_bytes));
+        assert!(
+            work.maintenance_status()?.wal_storage_bytes()
+                <= u64::from(crate::SharedWalOptions::default().segment_bytes)
+        );
     }
     println!(
         "raw_wal_bytes={raw_bytes} chunks={chunks} source_archive_charged_bytes={}",

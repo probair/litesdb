@@ -3,6 +3,9 @@
 // This file is part of LiteSDB. See LICENSE for license details.
 // Project: https://github.com/probair/litesdb
 
+#[cfg(feature = "bench-metrics")]
+use crate::bench_metrics::{self, Counter, Span, Stage};
+
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -50,6 +53,13 @@ impl FileUnitSource {
     }
 
     pub(crate) fn reopen(&self, root: &Path, units: &[UnitMeta]) -> Result<Self> {
+        #[cfg(feature = "bench-metrics")]
+        let _profile = Span::new(Stage::SourceReopen);
+        #[cfg(feature = "bench-metrics")]
+        bench_metrics::count(
+            Counter::ReopenedUnits,
+            u64::try_from(units.len()).unwrap_or(u64::MAX),
+        );
         Self::with_cache(root, units, Arc::clone(&self.directories))
     }
 
@@ -162,7 +172,6 @@ impl FileUnitSource {
         self.directories.lock().map_err(|_| Error::Poisoned)
     }
 
-    #[cfg(feature = "archive")]
     pub(crate) fn validate_all(&self) -> Result<()> {
         for unit in self.units.values() {
             load_directory(&unit.path, unit.meta)?;

@@ -371,24 +371,26 @@ fn maintain_reports_due_sync_and_seal_without_leaving_a_durability_gap() {
 }
 
 #[test]
-fn open_report_counts_replay_and_physical_tail_repair() {
-    let root = TestDir::new("open-report-repair");
+fn shared_tail_repair_preserves_original_and_replay_prefix() {
+    let root = TestDir::new("shared-open-report-repair");
     let database =
         Db::open(root.path(), OpenOptions::default()).unwrap_or_else(|_| unreachable!("open"));
     let table = database
         .create_table(spec())
         .unwrap_or_else(|_| unreachable!("create table"));
-    let repair_start = database
+    database
         .sync()
-        .unwrap_or_else(|_| unreachable!("sync"))
-        .offset();
+        .unwrap_or_else(|_| unreachable!("sync schema"));
     database
         .append(table, &observation(10, 10))
         .unwrap_or_else(|_| unreachable!("append"));
+    database
+        .sync()
+        .unwrap_or_else(|_| unreachable!("sync before simulated tear"));
     drop(database);
-
-    let mut segments = fs::read_dir(root.path().join("wal"))
-        .unwrap_or_else(|_| unreachable!("read WAL"))
+    let shared = root.path().join("_shared");
+    let mut segments = fs::read_dir(shared.join("wal"))
+        .unwrap_or_else(|_| unreachable!("read shared WAL"))
         .map(|entry| entry.unwrap_or_else(|_| unreachable!("WAL entry")).path())
         .collect::<Vec<_>>();
     segments.sort_unstable();
@@ -403,36 +405,48 @@ fn open_report_counts_replay_and_physical_tail_repair() {
         .open(active)
         .unwrap_or_else(|_| unreachable!("open WAL"))
         .set_len(length.saturating_sub(3))
-        .unwrap_or_else(|_| unreachable!("truncate WAL"));
-    let damaged_bytes = fs::read(active).unwrap_or_else(|_| unreachable!("read damaged WAL"));
-
-    let (database, report) = Db::open_with_report(root.path(), OpenOptions::default())
-        .unwrap_or_else(|_| unreachable!("reopen"));
-    assert_eq!(report.replayed_records(), 1);
-    assert_eq!(report.tail_repairs(), 1);
-    assert_eq!(
-        report.repaired_bytes(),
-        length.saturating_sub(3).saturating_sub(repair_start)
-    );
-    assert_eq!(report.recovery_checkpointed_records(), 1);
-    assert_eq!(report.recovery_unit_id(), None);
-    assert_eq!(report.wal_bytes(), 32);
-    assert_eq!(report.wal_storage_bytes(), length.saturating_sub(3) + 32);
-    let preserved = fs::read_dir(root.path().join("wal/damaged"))
-        .unwrap_or_else(|_| unreachable!("damaged directory"))
-        .map(|entry| {
-            entry
-                .unwrap_or_else(|_| unreachable!("damaged entry"))
-                .path()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(preserved.len(), 1);
-    assert_eq!(fs::read(&preserved[0]).ok(), Some(damaged_bytes));
-    assert_eq!(
-        database
-            .maintenance_status()
-            .ok()
-            .map(crate::MaintenanceStatus::visible_seq),
-        Some(1)
-    );
+        .unwrap_or_else(|_| unreachable!("tear WAL"));
+    let damaged = fs::read(active).unwrap_or_else(|_| unreachable!("damaged WAL"));
+    let mut evidence = None;
+    for _ in 0..2 {
+        let (database, report) = Db::open_with_report(root.path(), OpenOptions::default())
+            .unwrap_or_else(|_| unreachable!("recover shared prefix"));
+        assert_eq!(report.replayed_records(), 1);
+        assert_eq!(
+            database
+                .maintenance_status()
+                .unwrap_or_default()
+                .visible_seq(),
+            1
+        );
+        assert_eq!(
+            database.snapshot().table_last_timestamp(table).ok(),
+            Some(None)
+        );
+        assert_eq!(fs::read(active).ok(), Some(damaged.clone()));
+        let boundary = fs::read(shared.join("BOUNDARY-00000000000000000001"))
+            .unwrap_or_else(|_| unreachable!("durable boundary"));
+        if let Some(previous) = &evidence {
+            assert_eq!(&boundary, previous);
+        }
+        evidence = Some(boundary);
+    }
+    let database =
+        Db::open(root.path(), OpenOptions::default()).unwrap_or_else(|_| unreachable!("resume"));
+    database
+        .append(table, &observation(20, 20))
+        .unwrap_or_else(|_| unreachable!("resume append"));
+    database
+        .sync()
+        .unwrap_or_else(|_| unreachable!("resume sync"));
+    drop(database);
+    for _ in 0..2 {
+        let database = Db::open(root.path(), OpenOptions::default())
+            .unwrap_or_else(|_| unreachable!("resume reopen"));
+        assert_eq!(
+            database.snapshot().table_last_timestamp(table).ok(),
+            Some(Some(20))
+        );
+        assert_eq!(fs::read(active).ok(), Some(damaged.clone()));
+    }
 }

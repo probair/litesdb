@@ -7,10 +7,9 @@ use super::format::{Reader, read_record};
 use crate::{Error, Result};
 use sha2::{Digest, Sha256};
 
-pub(crate) const CURSOR_BYTES: usize = 104;
+pub(crate) const CURSOR_BYTES: usize = 120;
 pub(crate) const EXPORT_HEADER: usize = 8 + CURSOR_BYTES * 2;
 pub(crate) const MAX_EXPORT_BYTES: u32 = 4_194_304;
-pub(crate) const LOG_TARGET_BYTES: u64 = 1_048_576;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArchiveOptions {
@@ -38,6 +37,7 @@ impl ArchiveOptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArchiveCursor {
     pub(crate) database: [u8; 16],
+    pub(crate) generation: [u8; 16],
     pub(crate) branch: [u8; 16],
     pub(crate) epoch: u64,
     pub(crate) segment: u64,
@@ -52,21 +52,23 @@ impl ArchiveCursor {
     }
     fn encoded(self) -> [u8; CURSOR_BYTES] {
         let mut bytes = [0; CURSOR_BYTES];
-        bytes[..8].copy_from_slice(b"LSAC\x01\0\0\0");
+        bytes[..8].copy_from_slice(b"LSAC\x02\0\0\0");
         bytes[8..24].copy_from_slice(&self.database);
-        bytes[24..40].copy_from_slice(&self.branch);
-        bytes[40..48].copy_from_slice(&self.epoch.to_le_bytes());
-        bytes[48..56].copy_from_slice(&self.segment.to_le_bytes());
-        bytes[56..64].copy_from_slice(&self.offset.to_le_bytes());
-        bytes[64..72].copy_from_slice(&self.seq.to_le_bytes());
-        bytes[72..].copy_from_slice(&self.digest);
+        bytes[24..40].copy_from_slice(&self.generation);
+        bytes[40..56].copy_from_slice(&self.branch);
+        bytes[56..64].copy_from_slice(&self.epoch.to_le_bytes());
+        bytes[64..72].copy_from_slice(&self.segment.to_le_bytes());
+        bytes[72..80].copy_from_slice(&self.offset.to_le_bytes());
+        bytes[80..88].copy_from_slice(&self.seq.to_le_bytes());
+        bytes[88..].copy_from_slice(&self.digest);
         bytes
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut reader = Reader::new(bytes);
-        reader.magic(b"LSAC\x01\0\0\0")?;
+        reader.magic(b"LSAC\x02\0\0\0")?;
         let cursor = Self {
             database: reader.array()?,
+            generation: reader.array()?,
             branch: reader.array()?,
             epoch: reader.u64()?,
             segment: reader.u64()?,
@@ -111,7 +113,9 @@ impl ArchiveCursor {
         Ok(true)
     }
     pub(crate) fn same_history(self, other: Self) -> bool {
-        self.database == other.database && self.branch == other.branch
+        self.database == other.database
+            && self.generation == other.generation
+            && self.branch == other.branch
     }
     pub(crate) fn advance(self, epoch: u64, segment: u64, offset: u64, raw: &[u8]) -> Result<Self> {
         let seq = crate::wal::record::inspect(raw)?;
@@ -194,7 +198,7 @@ impl ExportChunk {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(EXPORT_HEADER.saturating_add(self.records.len()));
-        bytes.extend_from_slice(b"LSEX\x01\0\0\0");
+        bytes.extend_from_slice(b"LSEX\x02\0\0\0");
         bytes.extend_from_slice(&self.start.to_bytes());
         bytes.extend_from_slice(&self.end.to_bytes());
         bytes.extend_from_slice(&self.records);
@@ -209,7 +213,7 @@ impl ExportChunk {
             ));
         }
         let mut reader = Reader::new(bytes);
-        reader.magic(b"LSEX\x01\0\0\0")?;
+        reader.magic(b"LSEX\x02\0\0\0")?;
         let start = ArchiveCursor::from_bytes(reader.take(CURSOR_BYTES)?)?;
         let end = ArchiveCursor::from_bytes(reader.take(CURSOR_BYTES)?)?;
         let records = reader.remaining();

@@ -9,9 +9,12 @@ Project: https://github.com/probair/litesdb
 
 LiteSDB is a lightweight embedded time-series database tailored for server monitoring.
 
+Multiple logical databases can share one buffered physical WAL while keeping independent tails, manifests and sealed files.
+See the shared storage APIs in `litesdb-core`; old storage formats are explicitly rejected.
+
 ## Advantages
 
-The following figures are single-run engineering measurements from the current release
+The following figures are historical single-run engineering measurements from the earlier standalone-WAL
 environment. They are for reference only and are not guarantees.
 
 - Minimal storage cost: about **5.0 MB per host for 30 days** under the reference workload.

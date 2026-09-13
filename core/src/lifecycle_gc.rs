@@ -3,6 +3,9 @@
 // This file is part of LiteSDB. See LICENSE for license details.
 // Project: https://github.com/probair/litesdb
 
+#[cfg(feature = "bench-metrics")]
+use crate::bench_metrics::{self, Counter, Span, Stage};
+
 use std::{
     collections::BTreeSet,
     ffi::OsString,
@@ -58,6 +61,13 @@ pub(crate) fn advance(
 }
 
 pub(crate) fn reap(directory: &DbDir, garbage: &mut Vec<DeferredDelete>) {
+    #[cfg(feature = "bench-metrics")]
+    let _profile = Span::new(Stage::GarbageCollect);
+    #[cfg(feature = "bench-metrics")]
+    bench_metrics::count(
+        Counter::GarbageCandidates,
+        u64::try_from(garbage.len()).unwrap_or(u64::MAX),
+    );
     garbage.retain_mut(|artifact| {
         if artifact.owner.upgrade().is_some() {
             return true;

@@ -227,7 +227,7 @@ fn directory_cache_options_validate_before_creating_database() -> Result<()> {
 }
 
 #[test]
-fn recovery_seal_uses_reopened_cache_budget_and_preserves_timestamp() -> Result<()> {
+fn scheduled_seal_uses_reopened_cache_budget_and_preserves_timestamp() -> Result<()> {
     for budget in [0, 256] {
         let root = TestDir::new("directory-cache-recovery-seal");
         let original = OpenOptions {
@@ -236,7 +236,6 @@ fn recovery_seal_uses_reopened_cache_budget_and_preserves_timestamp() -> Result<
                 bytes: 90,
                 ..crate::SealPolicy::default()
             },
-            wal_max_bytes: 512,
             ..OpenOptions::default()
         };
         let db = Db::open(root.path(), original)?;
@@ -248,13 +247,18 @@ fn recovery_seal_uses_reopened_cache_budget_and_preserves_timestamp() -> Result<
         let (db, report) = Db::open_with_report(
             root.path(),
             OpenOptions {
-                wal_max_bytes: 100,
                 directory_cache_bytes: budget,
                 ..original
             },
         )?;
-        assert_eq!(report.recovery_checkpointed_records(), 3);
-        assert!(report.recovery_unit_id().is_some());
+        assert_eq!(report.replayed_records(), 3);
+        assert_eq!(report.recovery_checkpointed_records(), 0);
+        let sealed = db
+            .maintain()?
+            .sealed()
+            .unwrap_or_else(|| unreachable!("scheduled seal"));
+        assert_eq!(sealed.checkpointed_records(), 3);
+        assert!(sealed.unit_id().is_some());
         assert_eq!(db.snapshot().table_last_timestamp(table)?, Some(20));
         assert_eq!(timestamps(&db.snapshot(), table, 0)?, vec![10, 20]);
         let charged = db.maintenance_status()?.directory_cache_bytes();

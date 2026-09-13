@@ -3,8 +3,10 @@
 // This file is part of LiteSDB. See LICENSE for license details.
 // Project: https://github.com/probair/litesdb
 
+#[cfg(feature = "bench-metrics")]
+use crate::bench_metrics::{self, Counter, Span, Stage};
+
 use std::{
-    fs,
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
@@ -13,14 +15,13 @@ use std::{
 use crate::{
     Error, FieldId, MaintenanceStatus, Observation, OpenReport, Result, SeriesId, Snapshot,
     TableId, TableSpec, VersionSpec,
-    db_open::{finalize_open, initialize_new, open_existing},
-    fsutil::{Area, DbDir, DbLock},
+    fsutil::{Area, DbDir},
     lifecycle_gc::{self, DeferredDelete, Generation},
     manifest::Manifest,
-    options::validate,
     retention::RetentionHeads,
+    shared_wal::SharedMember,
     unit::FileUnitSource,
-    wal::{DurablePosition, RecordBody, ReplayTarget, TailIndex, WalWriter},
+    wal::{DurablePosition, RecordBody, ReplayTarget, TailIndex},
 };
 
 #[cfg(test)]
@@ -40,7 +41,7 @@ impl Seq {
 pub(crate) struct Engine {
     pub(crate) manifest: Manifest,
     pub(crate) tail: Arc<TailIndex>,
-    pub(crate) writer: WalWriter,
+    pub(crate) writer: SharedMember,
     pub(crate) source: Arc<FileUnitSource>,
     pub(crate) heads: Option<Arc<RetentionHeads>>,
     pub(crate) generation: Generation,
@@ -64,7 +65,7 @@ impl Engine {
 pub struct Db {
     pub(crate) directory: Arc<DbDir>,
     pub(crate) engine: Mutex<Engine>,
-    visible: Mutex<Option<Snapshot>>,
+    pub(crate) visible: Mutex<Option<Snapshot>>,
     pub(crate) options: OpenOptions,
 }
 
@@ -90,89 +91,40 @@ impl Db {
         #[cfg(feature = "archive")] archive_options: Option<crate::archive::ArchiveOptions>,
         #[cfg(feature = "archive")] restoring: bool,
     ) -> Result<(Self, OpenReport)> {
+        #[cfg(not(feature = "archive"))]
+        let restoring = false;
         #[cfg(feature = "archive")]
         let archive_requested = archive_options.is_some();
         #[cfg(not(feature = "archive"))]
         let archive_requested = false;
+        let opened = crate::db_open::open_single(root, options, restoring, archive_requested)?;
         #[cfg(feature = "archive")]
         if let Some(options) = archive_options {
-            options.validate()?;
+            opened.0.enable_archive(options)?;
         }
-        #[cfg(not(feature = "archive"))]
-        let restoring = false;
-        crate::db_open::ensure_open_mode(root, archive_requested, restoring)?;
-        let started = Instant::now();
-        let config = validate(options)?;
-        fs::create_dir_all(root)?;
-        let lock = Arc::new(DbLock::acquire(root)?);
-        let directory = Arc::new(DbDir::initialize(root)?);
-        directory.clear_temporary()?;
-        #[cfg(feature = "archive")]
-        let loaded_archive = crate::archive::preflight(&directory, archive_options)?;
-        let manifest_path = directory.file(Area::Root, "MANIFEST");
-        let opened = if manifest_path.try_exists()? {
-            open_existing(&directory, config, options.directory_cache_bytes)?
-        } else {
-            initialize_new(&directory, config, options.directory_cache_bytes)?
-        };
-        #[cfg(feature = "archive")]
-        let opened = {
-            let mut opened = opened;
-            if let Some(options) = archive_options {
-                opened
-                    .writer
-                    .attach_archive(&directory, options, loaded_archive)?;
-            }
-            opened
-        };
-        let tail = Arc::new(opened.tail);
-        let source = Arc::new(opened.source);
-        let generation = Generation::new(lock);
-        let opened_at = Instant::now();
-        let snapshot = Snapshot::new(
-            Arc::from(opened.catalog.units()),
-            Arc::clone(&source),
-            Arc::clone(&tail),
-            opened.catalog.retention().floor(),
-            opened.heads.clone(),
-            generation.clone(),
-        );
-        let database = Self {
-            directory,
-            engine: Mutex::new(Engine {
-                manifest: opened.catalog,
-                tail,
-                writer: opened.writer,
-                source,
-                heads: opened.heads,
-                generation,
-                garbage: Vec::new(),
-                maintenance_due: false,
-                last_sync: opened_at,
-                last_seal: opened_at,
-            }),
-            visible: Mutex::new(Some(snapshot)),
-            options,
-        };
-        let recovery_seal = finalize_open(&database, options.takeover)?;
-        let (wal_bytes, wal_storage_bytes) = {
-            let engine = database.lock_engine()?;
-            (engine.writer.wal_bytes(), engine.writer.storage_bytes())
-        };
-        let report = OpenReport {
-            elapsed: started.elapsed(),
-            replayed_records: opened.replayed_records,
-            tail_repairs: opened.tail_repairs,
-            repaired_bytes: opened.repaired_bytes,
-            recovery_checkpointed_records: recovery_seal.checkpointed_records(),
-            recovery_unit_id: recovery_seal.unit_id(),
-            wal_bytes,
-            wal_storage_bytes,
-        };
-        Ok((database, report))
+        Ok(opened)
+    }
+
+    pub fn estimated_append_growth(entry_count: usize) -> Result<u64> {
+        crate::wal::estimate_row_bytes(entry_count)
+    }
+
+    #[must_use]
+    pub const fn tail_limit_bytes() -> u64 {
+        crate::limits::MAX_TAIL_INDEX_BYTES as u64
     }
 
     pub fn append(&self, table: TableId, observation: &Observation) -> Result<Seq> {
+        #[cfg(feature = "bench-metrics")]
+        let _profile = Span::new(Stage::Append);
+        #[cfg(feature = "bench-metrics")]
+        {
+            bench_metrics::count(Counter::ObservationAttempts, 1);
+            bench_metrics::count(
+                Counter::ObservationEntries,
+                u64::try_from(observation.entries().len()).unwrap_or(u64::MAX),
+            );
+        }
         self.mutate(&RecordBody::AppendObservation {
             table,
             observation: observation.clone(),
@@ -228,6 +180,8 @@ impl Db {
     }
 
     pub fn sync(&self) -> Result<DurablePosition> {
+        #[cfg(feature = "bench-metrics")]
+        let _profile = Span::new(Stage::DbSync);
         let mut engine = self.lock_engine()?;
         lifecycle_gc::reap(&self.directory, &mut engine.garbage);
         let durable = engine.writer.sync()?;
@@ -237,6 +191,7 @@ impl Db {
 
     pub fn maintenance_status(&self) -> Result<MaintenanceStatus> {
         let engine = self.lock_engine()?;
+        engine.writer.ensure_healthy()?;
         let now = Instant::now();
         let unsynced_bytes = engine.writer.unsynced_bytes();
         let sync_due_in = match self.options.sync_policy {
@@ -324,15 +279,27 @@ impl Db {
     }
 
     fn mutate(&self, body: &RecordBody) -> Result<Seq> {
+        #[cfg(feature = "bench-metrics")]
+        let lock_profile = Span::new(Stage::MutationLock);
         let mut engine = self.lock_engine()?;
+        #[cfg(feature = "bench-metrics")]
+        drop(lock_profile);
         self.mutate_locked(&mut engine, body)
     }
 
     fn mutate_locked(&self, engine: &mut Engine, body: &RecordBody) -> Result<Seq> {
         engine.writer.ensure_healthy()?;
+        #[cfg(feature = "bench-metrics")]
+        let gc_profile = Span::new(Stage::MutationGc);
         lifecycle_gc::reap(&self.directory, &mut engine.garbage);
+        #[cfg(feature = "bench-metrics")]
+        drop(gc_profile);
         let seq = engine.tail.next_seq();
+        #[cfg(feature = "bench-metrics")]
+        let validate_profile = Span::new(Stage::MutationValidate);
         engine.tail.validate(seq, body).map_err(caller_error)?;
+        #[cfg(feature = "bench-metrics")]
+        drop(validate_profile);
         if engine.writer.append_requires_checkpoint(body)? {
             self.seal_locked(engine)?;
         }
@@ -343,12 +310,18 @@ impl Db {
                 "WAL sequence disagrees with tail",
             ));
         }
+        #[cfg(feature = "bench-metrics")]
+        let _tail_profile = Span::new(Stage::TailApply);
         self.invalidate_visible();
+        #[cfg(feature = "bench-metrics")]
+        bench_metrics::count(Counter::TailBytesBeforeApply, engine.tail.estimated_bytes());
         Arc::make_mut(&mut engine.tail)
             .apply(seq, body.clone())
             .map_err(|_| Error::corruption("Db append", "validated tail mutation failed"))?;
-        engine.maintenance_due |= outcome.seal_recommended()
-            || engine.tail.estimated_bytes() >= u64::from(self.options.seal_policy.memory_bytes);
+        engine.maintenance_due |=
+            engine.tail.estimated_bytes() >= u64::from(self.options.seal_policy.memory_bytes);
+        #[cfg(feature = "bench-metrics")]
+        bench_metrics::count(Counter::AppliedRecords, 1);
         Ok(Seq(seq))
     }
 
@@ -365,6 +338,13 @@ impl Db {
     }
 
     fn snapshot_from_engine(engine: &Engine) -> Snapshot {
+        #[cfg(feature = "bench-metrics")]
+        let _profile = Span::new(Stage::SnapshotBuild);
+        #[cfg(feature = "bench-metrics")]
+        bench_metrics::count(
+            Counter::SnapshotUnits,
+            u64::try_from(engine.manifest.units().len()).unwrap_or(u64::MAX),
+        );
         Snapshot::new(
             Arc::from(engine.manifest.units()),
             Arc::clone(&engine.source),
@@ -409,3 +389,6 @@ mod bounded_wal_tests;
 #[cfg(feature = "archive")]
 #[path = "db_archive.rs"]
 mod archive_support;
+
+#[path = "db_batch.rs"]
+mod batch;

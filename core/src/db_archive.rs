@@ -6,8 +6,20 @@
 use super::Db;
 use crate::{OpenOptions, Result, wal::ReplayTarget};
 impl Db {
-    pub(crate) fn open_for_restore(root: &std::path::Path, options: OpenOptions) -> Result<Self> {
-        Self::open_configured(root, options, None, true).map(|(db, _)| db)
+    pub(crate) fn open_for_restore(
+        root: &std::path::Path,
+        options: OpenOptions,
+        cursor: crate::ArchiveCursor,
+    ) -> Result<Self> {
+        let owner =
+            crate::SharedWal::open(&root.join("_shared"), crate::SharedWalOptions::default())?;
+        crate::db_open::open_imported(
+            owner,
+            root,
+            crate::SharedDbId::new(cursor.database, cursor.generation),
+            options,
+        )
+        .map(|(db, _)| db)
     }
     pub(crate) fn validate_restored_storage(&self) -> Result<()> {
         self.lock_engine()?.source.validate_all()

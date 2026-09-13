@@ -3,139 +3,174 @@
 // This file is part of LiteSDB. See LICENSE for license details.
 // Project: https://github.com/probair/litesdb
 
-use std::{fs, sync::Arc};
-
 use crate::{
-    Db, Error, Result, SealReport,
-    fsutil::{Area, DbDir},
-    lifecycle_gc,
-    limits::MAX_OPERATION_MEMORY_BYTES,
+    Db, Error, OpenOptions, OpenReport, Result, SharedDbId, SharedWal, SharedWalOptions, Snapshot,
+    db::Engine,
+    fsutil::{Area, DbDir, DbLock},
+    lifecycle_gc::{self, Generation},
     manifest::{self, Manifest},
     retention::{RetentionHeads, decode_heads, head_name},
+    shared_wal::{self, SharedMember},
     unit::FileUnitSource,
-    wal::{Checkpoint, TailIndex, WalWriter, WriterConfig, recover},
+    wal::Checkpoint,
+};
+use std::{
+    fs::{self, File},
+    io::Read,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Instant,
 };
 
-pub(crate) struct Opened {
-    pub(crate) catalog: Manifest,
-    pub(crate) tail: TailIndex,
-    pub(crate) writer: WalWriter,
-    pub(crate) source: FileUnitSource,
-    pub(crate) heads: Option<Arc<RetentionHeads>>,
-    pub(crate) replayed_records: u64,
-    pub(crate) tail_repairs: u64,
-    pub(crate) repaired_bytes: u64,
-}
-
-pub(crate) fn open_existing(
-    directory: &DbDir,
-    config: WriterConfig,
-    directory_cache_bytes: u32,
-) -> Result<Opened> {
-    let catalog = manifest::load(directory)?;
-    let source = FileUnitSource::open(
-        &directory.path(Area::Units),
-        catalog.units(),
-        directory_cache_bytes,
-    )?;
-    let heads = load_heads(directory, &catalog)?;
-    let mut tail = catalog.replay_target()?;
-    let identity = catalog.identity();
-    let recovery = recover(
-        directory,
-        catalog.checkpoint(),
-        identity.shard_id(),
-        identity.writer_epoch(),
-        &mut tail,
-    )?;
-    let writer = WalWriter::resume(
-        directory,
-        config,
-        identity.shard_id(),
-        identity.writer_epoch(),
-        recovery,
-    )?;
-    lifecycle_gc::cleanup_unreferenced(directory, &catalog);
-    Ok(Opened {
-        catalog,
-        tail,
-        writer,
-        source,
-        heads,
-        replayed_records: recovery.replayed_records(),
-        tail_repairs: recovery.tail_repairs(),
-        repaired_bytes: recovery.repaired_bytes(),
-    })
-}
-
-pub(crate) fn initialize_new(
-    directory: &DbDir,
-    config: WriterConfig,
-    directory_cache_bytes: u32,
-) -> Result<Opened> {
-    clear_unowned_areas(directory)?;
-    let mut writer = WalWriter::create(directory, config, 0, 0, 1)?;
-    let durable = writer.sync()?;
-    let checkpoint = Checkpoint::new(durable.segment(), durable.offset(), 1)?;
-    let catalog = Manifest::initial(checkpoint)?;
-    manifest::publish(directory, None, &catalog)?;
-    let source = FileUnitSource::open(&directory.path(Area::Units), &[], directory_cache_bytes)?;
-    Ok(Opened {
-        catalog,
-        tail: TailIndex::new(0, 1),
-        writer,
-        source,
-        heads: None,
-        replayed_records: 0,
-        tail_repairs: 0,
-        repaired_bytes: 0,
-    })
-}
-
-pub(crate) fn finalize_open(database: &Db, takeover: bool) -> Result<SealReport> {
-    let (target_epoch, seal_required) = {
-        let mut engine = database.lock_engine()?;
-        let current_epoch = engine.manifest.identity().writer_epoch();
-        let target_epoch = if takeover {
-            current_epoch
-                .checked_add(1)
-                .ok_or_else(|| Error::limit("writer_epoch", u64::MAX, u64::MAX))?
-        } else {
-            current_epoch
-        };
-        let tail_nonempty = engine.tail.next_seq() != engine.manifest.checkpoint().next_seq();
-        let seal_required = engine
-            .writer
-            .recovery_seal_required(target_epoch, tail_nonempty)?;
-        (target_epoch, seal_required)
-    };
-
-    let recovery_seal = if seal_required {
-        database.seal()?
-    } else {
-        SealReport::default()
-    };
-
-    let mut engine = database.lock_engine()?;
-    let tail_nonempty = engine.tail.next_seq() != engine.manifest.checkpoint().next_seq();
-    if engine
-        .writer
-        .recovery_seal_required(target_epoch, tail_nonempty)?
-    {
-        return Err(Error::corruption(
-            "WAL takeover",
-            "one recovery Seal did not normalize WAL capacity",
+pub(crate) fn open_single(
+    root: &Path,
+    options: OpenOptions,
+    restoring: bool,
+    archive_requested: bool,
+) -> Result<(Db, OpenReport)> {
+    crate::options::validate(options)?;
+    ensure_open_mode(root, archive_requested, restoring)?;
+    validate_new_root(root)?;
+    let binding = shared_wal::read_binding(root)?;
+    #[cfg(feature = "archive")]
+    if binding.is_none() && root.join("SEALED").try_exists()? {
+        let descriptor = crate::archive::sealed::verify(root)?;
+        let id = SharedDbId::new(descriptor.cursor.database, descriptor.cursor.generation);
+        let owner = SharedWal::open(&root.join("_shared"), SharedWalOptions::default())?;
+        return crate::archive::sealed::install(owner, root, id, options);
+    }
+    if root.join("MANIFEST").try_exists()? && binding.is_none() {
+        return Err(Error::unsupported(
+            "open",
+            "old standalone format has no shared binding",
         ));
     }
-    engine.writer.ensure_epoch_adoptable(target_epoch)?;
-    if takeover {
-        let next = engine.manifest.successor_writer_epoch()?;
-        if next.identity().writer_epoch() != target_epoch {
-            return Err(Error::corruption(
-                "WAL takeover",
-                "MANIFEST successor disagrees with target epoch",
-            ));
+    let owner = SharedWal::open(&root.join("_shared"), SharedWalOptions::default())?;
+    let id = if let Some((_, id)) = binding {
+        id
+    } else if let Some(id) = owner.registered_id(root)? {
+        id
+    } else {
+        let mut database = [0; 16];
+        let mut generation = [0; 16];
+        let mut random = File::open("/dev/urandom")?;
+        random.read_exact(&mut database)?;
+        random.read_exact(&mut generation)?;
+        SharedDbId::new(database, generation)
+    };
+    open_shared_configured(owner, root, id, options, archive_requested)
+}
+pub(crate) fn open_shared(
+    owner: SharedWal,
+    root: &Path,
+    id: SharedDbId,
+    options: OpenOptions,
+) -> Result<(Db, OpenReport)> {
+    open_shared_configured(owner, root, id, options, false)
+}
+
+pub(crate) fn open_shared_configured(
+    owner: SharedWal,
+    root: &Path,
+    id: SharedDbId,
+    options: OpenOptions,
+    archive_requested: bool,
+) -> Result<(Db, OpenReport)> {
+    open_shared_inner(owner, root, id, options, archive_requested, false)
+}
+
+#[cfg(feature = "archive")]
+pub(crate) fn open_imported(
+    owner: SharedWal,
+    root: &Path,
+    id: SharedDbId,
+    options: OpenOptions,
+) -> Result<(Db, OpenReport)> {
+    open_shared_inner(owner, root, id, options, false, true)
+}
+
+fn open_shared_inner(
+    owner: SharedWal,
+    root: &Path,
+    id: SharedDbId,
+    options: OpenOptions,
+    archive_requested: bool,
+    imported: bool,
+) -> Result<(Db, OpenReport)> {
+    ensure_open_mode(root, archive_requested, imported)?;
+    let started = Instant::now();
+    crate::options::validate(options)?;
+    owner.validate_open(root, id)?;
+    validate_new_root(root)?;
+    if root.join("MANIFEST").try_exists()?
+        && !imported
+        && !shared_wal::verify_binding(root, owner.identity(), id)?
+    {
+        return Err(Error::unsupported(
+            "open",
+            "old or unbound MANIFEST is not supported",
+        ));
+    }
+    fs::create_dir_all(root)?;
+    let lock = Arc::new(DbLock::acquire(root)?);
+    let directory = Arc::new(DbDir::initialize(root)?);
+    if imported {
+        owner.register_imported(&directory, id)?;
+    } else {
+        owner.register(&directory, id)?;
+    }
+    directory.clear_temporary()?;
+    let catalog = if root.join("MANIFEST").try_exists()? {
+        manifest::load(&directory)?
+    } else {
+        let catalog = Manifest::initial(Checkpoint::new(1, 32, 1)?)?;
+        if let Err(error) = manifest::publish(&directory, None, &catalog) {
+            owner.poison();
+            return Err(error);
         }
+        catalog
+    };
+    owner.initialized(id, catalog.checkpoint().next_seq().saturating_sub(1))?;
+    let source = Arc::new(FileUnitSource::open(
+        &directory.path(Area::Units),
+        catalog.units(),
+        options.directory_cache_bytes,
+    )?);
+    let heads = load_heads(&directory, &catalog)?;
+    let mut tail = catalog.replay_target()?;
+    let (writer, replayed) = SharedMember::recover(owner, id, &directory, &mut tail)?;
+    lifecycle_gc::cleanup_unreferenced(&directory, &catalog);
+    let generation = Generation::new(lock);
+    let tail = Arc::new(tail);
+    let snapshot = Snapshot::new(
+        Arc::from(catalog.units()),
+        Arc::clone(&source),
+        Arc::clone(&tail),
+        catalog.retention().floor(),
+        heads.clone(),
+        generation.clone(),
+    );
+    let now = Instant::now();
+    let database = Db {
+        directory,
+        engine: Mutex::new(Engine {
+            manifest: catalog,
+            tail,
+            writer,
+            source,
+            heads,
+            generation,
+            garbage: Vec::new(),
+            maintenance_due: false,
+            last_sync: now,
+            last_seal: now,
+        }),
+        visible: Mutex::new(Some(snapshot)),
+        options,
+    };
+    if options.takeover {
+        let mut engine = database.lock_engine()?;
+        let next = engine.manifest.successor_writer_epoch()?;
         if let Err(error) = manifest::publish(
             &database.directory,
             Some(engine.manifest.identity().generation()),
@@ -146,12 +181,21 @@ pub(crate) fn finalize_open(database: &Db, takeover: bool) -> Result<SealReport>
         }
         engine.manifest = next;
     }
-    engine
-        .writer
-        .adopt_epoch(&database.directory, target_epoch)?;
-    Ok(recovery_seal)
+    let state = database.maintenance_status()?;
+    Ok((
+        database,
+        OpenReport {
+            elapsed: started.elapsed(),
+            replayed_records: replayed,
+            tail_repairs: 0,
+            repaired_bytes: 0,
+            recovery_checkpointed_records: 0,
+            recovery_unit_id: None,
+            wal_bytes: state.wal_bytes(),
+            wal_storage_bytes: state.wal_storage_bytes(),
+        },
+    ))
 }
-
 fn load_heads(directory: &DbDir, catalog: &Manifest) -> Result<Option<Arc<RetentionHeads>>> {
     match (
         catalog.retention().floor(),
@@ -160,16 +204,15 @@ fn load_heads(directory: &DbDir, catalog: &Manifest) -> Result<Option<Arc<Retent
         (None, None) => Ok(None),
         (Some(floor), Some(generation)) => {
             let path = directory.file(Area::Heads, &head_name(generation));
-            let metadata = fs::metadata(&path)?;
-            if metadata.len() > u64::from(MAX_OPERATION_MEMORY_BYTES) {
+            let length = fs::metadata(&path)?.len();
+            if length > u64::from(crate::limits::MAX_OPERATION_MEMORY_BYTES) {
                 return Err(Error::limit(
                     "operation_memory_bytes",
-                    metadata.len(),
-                    u64::from(MAX_OPERATION_MEMORY_BYTES),
+                    length,
+                    crate::limits::MAX_OPERATION_MEMORY_BYTES.into(),
                 ));
             }
-            let bytes = fs::read(path)?;
-            Ok(Some(Arc::new(decode_heads(&bytes, floor)?)))
+            Ok(Some(Arc::new(decode_heads(&fs::read(path)?, floor)?)))
         }
         _ => Err(Error::corruption(
             "MANIFEST retention",
@@ -177,39 +220,17 @@ fn load_heads(directory: &DbDir, catalog: &Manifest) -> Result<Option<Arc<Retent
         )),
     }
 }
-
-fn clear_unowned_areas(directory: &DbDir) -> Result<()> {
-    for entry in fs::read_dir(directory.path(Area::Root))? {
-        let name = entry?.file_name();
-        if !matches!(
-            name.to_str(),
-            Some("LOCK" | "wal" | "units" | "heads" | "agg" | "tmp")
-        ) {
-            return Err(Error::corruption(
-                "database root",
-                "nonempty root without MANIFEST contains a foreign entry",
-            ));
-        }
-    }
-    for area in [Area::Wal, Area::Units, Area::Heads, Area::Aggregates] {
-        for entry in fs::read_dir(directory.path(area))? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(entry.path())?;
-            } else {
-                fs::remove_file(entry.path())?;
-            }
-        }
-        directory.sync(area)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn ensure_open_mode(
-    root: &std::path::Path,
+    root: &Path,
     archive_requested: bool,
     restoring: bool,
 ) -> Result<()> {
+    if root.join("EXPORT-WORK").try_exists()? {
+        return Err(Error::unsupported(
+            "open",
+            "database is an unfinished sealed export",
+        ));
+    }
     if !archive_requested
         && (root.join("ARCHIVE").try_exists()? || root.join("archive").try_exists()?)
     {
@@ -222,6 +243,34 @@ pub(crate) fn ensure_open_mode(
         return Err(Error::unsupported(
             "open",
             "database is an unfinished restore generation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_new_root(root: &Path) -> Result<()> {
+    if !root.try_exists()?
+        || root.join("MANIFEST").try_exists()?
+        || root.join("SHARED").try_exists()?
+    {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !matches!(
+            entry.file_name().to_str(),
+            Some("LOCK" | "wal" | "units" | "heads" | "agg" | "tmp" | "_shared" | "RESTORE-WORK")
+        ) {
+            return Err(Error::corruption(
+                "database root",
+                "unbound root contains foreign artifacts",
+            ));
+        }
+    }
+    if root.join("wal").try_exists()? && fs::read_dir(root.join("wal"))?.next().is_some() {
+        return Err(Error::unsupported(
+            "open",
+            "unbound legacy WAL is not supported",
         ));
     }
     Ok(())

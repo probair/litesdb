@@ -7,7 +7,8 @@ mod dir;
 mod lock;
 mod publish;
 
-pub(crate) use dir::{Area, DbDir, sync_directory};
+pub(crate) use dir::sync_directory;
+pub(crate) use dir::{Area, DbDir};
 pub(crate) use lock::DbLock;
 #[cfg(test)]
 pub(crate) use publish::PublishStep;

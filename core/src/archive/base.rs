@@ -50,6 +50,12 @@ impl Db {
             ));
         }
         let mut engine = self.lock_engine()?;
+        if parent.starts_with(engine.writer.owner.root_path()) {
+            return Err(crate::Error::invalid(
+                "export_dir",
+                "must be outside the shared owner",
+            ));
+        }
         engine.writer.ensure_healthy()?;
         engine.writer.archive_status()?;
         let pins = read_pins(&root)?;
@@ -71,13 +77,7 @@ impl Db {
         for area in ["wal", "units", "heads"] {
             fs::create_dir(export_dir.join(area))?;
         }
-        let mut paths = vec![
-            "MANIFEST".to_owned(),
-            format!(
-                "wal/{}",
-                crate::wal::segment::segment_name(engine.manifest.checkpoint().segment_first_seq())
-            ),
-        ];
+        let mut paths = vec!["MANIFEST".to_owned()];
         for unit in engine.manifest.units() {
             paths.push(format!("units/{:016x}.lsu", unit.unit_id()));
         }
@@ -175,7 +175,7 @@ fn read_pin_entries(root: &Path) -> Result<Vec<([u8; 16], ArchiveCursor)>> {
             || !raw.is_ascii()
             || pins.len() >= MAX_PINS
             || !entry.file_type()?.is_file()
-            || entry.metadata()?.len() != 160
+            || entry.metadata()?.len() != 176
         {
             return Err(super::invalid("invalid capture pin"));
         }
@@ -234,7 +234,7 @@ pub(crate) fn copy_file(source: &Path, target: &Path) -> Result<()> {
 
 fn encode_pin(id: [u8; 16], cursor: ArchiveCursor) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"LSAP\x01\0\0\0");
+    bytes.extend_from_slice(b"LSAP\x02\0\0\0");
     bytes.extend_from_slice(&id);
     bytes.extend_from_slice(&cursor.to_bytes());
     let digest = Sha256::digest(&bytes);
@@ -242,13 +242,13 @@ fn encode_pin(id: [u8; 16], cursor: ArchiveCursor) -> Vec<u8> {
     bytes
 }
 fn decode_pin(bytes: &[u8]) -> Result<([u8; 16], ArchiveCursor)> {
-    if bytes.len() != 160 || Sha256::digest(&bytes[..128]).as_slice() != &bytes[128..] {
+    if bytes.len() != 176 || Sha256::digest(&bytes[..144]).as_slice() != &bytes[144..] {
         return Err(super::invalid("capture pin checksum"));
     }
-    let mut reader = super::format::Reader::new(&bytes[..128]);
-    reader.magic(b"LSAP\x01\0\0\0")?;
+    let mut reader = super::format::Reader::new(&bytes[..144]);
+    reader.magic(b"LSAP\x02\0\0\0")?;
     let id = reader.array()?;
-    let cursor = ArchiveCursor::from_bytes(reader.take(104)?)?;
+    let cursor = ArchiveCursor::from_bytes(reader.take(super::types::CURSOR_BYTES)?)?;
     reader.finish()?;
     Ok((id, cursor))
 }

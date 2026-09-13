@@ -3,18 +3,16 @@
 // This file is part of LiteSDB. See LICENSE for license details.
 // Project: https://github.com/probair/litesdb
 
-use std::{
-    fs,
-    io::{Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
-};
-
 use crate::{
     CellValue, Db, ErrorKind, FieldId, FieldSchema, Lookup, Observation, ObservationEntry,
-    OpenOptions, SealPolicy, SeriesId, StreamKey, SyncPolicy, Validity, ValueType, VersionSpec,
+    OpenOptions, SealPolicy, SeriesId, SharedDbId, SharedWal, SharedWalOptions, StreamKey,
+    SyncPolicy, TableId, Validity, ValueType, VersionSpec,
     fsutil::{DbDir, TestDir},
     manifest,
-    wal::SegmentHeader,
+};
+use std::{
+    fs,
+    path::{Path, PathBuf},
 };
 
 fn spec() -> VersionSpec {
@@ -24,96 +22,67 @@ fn spec() -> VersionSpec {
     )
     .unwrap_or_else(|_| unreachable!("valid schema"))
 }
-
 fn observation(timestamp: i64) -> Observation {
     Observation::new(
         timestamp,
         vec![ObservationEntry::new(
             SeriesId::new(1),
             FieldId::new(1),
-            CellValue::UInt(7),
+            CellValue::UInt(u64::try_from(timestamp).unwrap_or_default()),
         )],
     )
     .unwrap_or_else(|_| unreachable!("valid observation"))
 }
-
-fn directory(root: &Path) -> DbDir {
-    DbDir::initialize(root).unwrap_or_else(|_| unreachable!("database directory"))
+fn catalog(root: &Path) -> manifest::Manifest {
+    manifest::load(&DbDir::initialize(root).unwrap_or_else(|_| unreachable!("directory")))
+        .unwrap_or_else(|_| unreachable!("catalog"))
 }
-
-fn segment_paths(root: &Path) -> Vec<PathBuf> {
-    let mut paths = fs::read_dir(root.join("wal"))
-        .unwrap_or_else(|_| unreachable!("read WAL directory"))
-        .map(|entry| entry.unwrap_or_else(|_| unreachable!("WAL entry")).path())
+fn segments(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut paths = fs::read_dir(root.join("_shared/wal"))
+        .unwrap_or_else(|_| unreachable!("shared WAL"))
+        .map(|entry| entry.unwrap_or_else(|_| unreachable!("entry")).path())
         .collect::<Vec<_>>();
     paths.sort_unstable();
     paths
-}
-
-fn segment_epochs(root: &Path) -> Vec<u64> {
-    let catalog = manifest::load(&directory(root)).unwrap_or_else(|_| unreachable!("manifest"));
-    segment_paths(root)
-        .iter()
+        .into_iter()
         .map(|path| {
-            let mut bytes = [0_u8; 32];
-            fs::File::open(path)
-                .and_then(|mut file| file.read_exact(&mut bytes))
-                .unwrap_or_else(|_| unreachable!("segment header"));
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_else(|| unreachable!("segment name"));
-            let first_seq = name
-                .strip_suffix(".wal")
-                .and_then(|digits| digits.parse::<u64>().ok())
-                .unwrap_or_else(|| unreachable!("segment sequence"));
-            SegmentHeader::decode(
-                &bytes,
-                first_seq,
-                catalog.identity().shard_id(),
-                catalog.identity().writer_epoch(),
-            )
-            .unwrap_or_else(|_| unreachable!("valid header"))
-            .writer_epoch()
+            let bytes = fs::read(&path).unwrap_or_else(|_| unreachable!("segment bytes"));
+            (path, bytes)
         })
         .collect()
 }
-
-fn rewrite_epoch(root: &Path, path: &Path, epoch: u64) {
-    let catalog = manifest::load(&directory(root)).unwrap_or_else(|_| unreachable!("manifest"));
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_else(|| unreachable!("segment name"));
-    let first_seq = name
-        .strip_suffix(".wal")
-        .and_then(|digits| digits.parse::<u64>().ok())
-        .unwrap_or_else(|| unreachable!("segment sequence"));
-    let header = SegmentHeader::new(first_seq, catalog.identity().shard_id(), epoch).encode();
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .unwrap_or_else(|_| unreachable!("open segment"));
-    file.seek(SeekFrom::Start(0))
-        .and_then(|_| file.write_all(&header))
-        .and_then(|()| file.sync_data())
-        .unwrap_or_else(|_| unreachable!("rewrite epoch"));
+fn latest(database: &Db, table: TableId, timestamp: i64) {
+    assert_eq!(
+        database
+            .snapshot()
+            .latest(&[StreamKey::new(table, SeriesId::new(1), FieldId::new(1))])
+            .ok(),
+        Some(vec![Lookup::Value {
+            value: CellValue::UInt(u64::try_from(timestamp).unwrap_or_default()),
+            at_ts: timestamp
+        }])
+    );
+}
+fn populated(root: &Path) -> TableId {
+    let database = Db::open(root, OpenOptions::default()).unwrap_or_else(|_| unreachable!("open"));
+    let table = database
+        .create_table(spec())
+        .unwrap_or_else(|_| unreachable!("table"));
+    for timestamp in [10, 20] {
+        database
+            .append(table, &observation(timestamp))
+            .unwrap_or_else(|_| unreachable!("append"));
+    }
+    database.sync().unwrap_or_else(|_| unreachable!("sync"));
+    table
 }
 
 #[test]
-fn takeover_advances_identity_and_keeps_old_epoch_records_readable() {
-    let root = TestDir::new("takeover-advance");
-    let database =
-        Db::open(root.path(), OpenOptions::default()).unwrap_or_else(|_| unreachable!("open"));
-    let table = database
-        .create_table(spec())
-        .unwrap_or_else(|_| unreachable!("create"));
-    database
-        .append(table, &observation(10))
-        .unwrap_or_else(|_| unreachable!("append"));
-    drop(database);
-    let before = manifest::load(&directory(root.path())).unwrap_or_else(|_| unreachable!());
-
+fn takeover_advances_identity_and_keeps_old_records_readable() {
+    let root = TestDir::new("shared-takeover-advance");
+    let table = populated(root.path());
+    let before = catalog(root.path());
+    let physical = segments(root.path());
     let database = Db::open(
         root.path(),
         OpenOptions {
@@ -122,353 +91,216 @@ fn takeover_advances_identity_and_keeps_old_epoch_records_readable() {
         },
     )
     .unwrap_or_else(|_| unreachable!("takeover"));
-    drop(database);
-    let after = manifest::load(&directory(root.path())).unwrap_or_else(|_| unreachable!());
+    let after = catalog(root.path());
     assert_eq!(
         after.identity().generation(),
-        before.identity().generation() + 1
+        before.identity().generation().saturating_add(1)
     );
     assert_eq!(
         after.identity().writer_epoch(),
-        before.identity().writer_epoch() + 1
+        before.identity().writer_epoch().saturating_add(1)
     );
-    assert_eq!(segment_epochs(root.path()), vec![0, 1]);
-
-    let database =
-        Db::open(root.path(), OpenOptions::default()).unwrap_or_else(|_| unreachable!("reopen"));
-    let key = StreamKey::new(table, SeriesId::new(1), FieldId::new(1));
-    assert_eq!(
-        database.snapshot().latest(&[key]).ok(),
-        Some(vec![Lookup::Value {
-            value: CellValue::UInt(7),
-            at_ts: 10,
-        }])
-    );
+    assert_eq!(segments(root.path()), physical);
+    latest(&database, table, 20);
+    drop(database);
+    for _ in 0..2 {
+        let database = Db::open(root.path(), OpenOptions::default())
+            .unwrap_or_else(|_| unreachable!("reopen"));
+        latest(&database, table, 20);
+        assert_eq!(catalog(root.path()), after);
+    }
 }
 
 #[test]
-fn future_and_decreasing_segment_epochs_are_corruption() {
-    let future = TestDir::new("takeover-future");
-    let database = Db::open(
-        future.path(),
-        OpenOptions {
-            takeover: true,
-            ..OpenOptions::default()
-        },
-    )
-    .unwrap_or_else(|_| unreachable!("open"));
-    drop(database);
-    let catalog = manifest::load(&directory(future.path())).unwrap_or_else(|_| unreachable!());
-    let active = segment_paths(future.path())
-        .pop()
-        .unwrap_or_else(|| unreachable!("active segment"));
-    rewrite_epoch(
-        future.path(),
-        &active,
-        catalog.identity().writer_epoch().saturating_add(1),
-    );
-    assert_eq!(
-        Db::open(future.path(), OpenOptions::default())
-            .err()
-            .map(|error| error.kind()),
-        Some(ErrorKind::Corruption)
-    );
-
-    let decreasing = TestDir::new("takeover-decreasing");
-    let database = Db::open(
-        decreasing.path(),
-        OpenOptions {
-            takeover: true,
-            ..OpenOptions::default()
-        },
-    )
-    .unwrap_or_else(|_| unreachable!("first takeover"));
-    let table = database
-        .create_table(spec())
-        .unwrap_or_else(|_| unreachable!("create"));
-    database
-        .append(table, &observation(10))
-        .unwrap_or_else(|_| unreachable!("append"));
-    drop(database);
-    let database = Db::open(
-        decreasing.path(),
-        OpenOptions {
-            takeover: true,
-            ..OpenOptions::default()
-        },
-    )
-    .unwrap_or_else(|_| unreachable!("second takeover"));
-    drop(database);
-    let active = segment_paths(decreasing.path())
-        .pop()
-        .unwrap_or_else(|| unreachable!("active segment"));
-    rewrite_epoch(decreasing.path(), &active, 0);
-    assert_eq!(
-        Db::open(decreasing.path(), OpenOptions::default())
-            .err()
-            .map(|error| error.kind()),
-        Some(ErrorKind::Corruption)
-    );
+fn forged_shared_database_or_generation_is_corruption() {
+    for identity_offset in [16_usize, 32] {
+        let root = TestDir::new("shared-takeover-forged-id");
+        populated(root.path());
+        let (path, mut bytes) = segments(root.path()).remove(0);
+        let start = 64_usize;
+        let length = u32::from_le_bytes(
+            bytes[start..start.saturating_add(4)]
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("frame length")),
+        ) as usize;
+        let identity_byte = start.saturating_add(identity_offset).saturating_add(15);
+        bytes[identity_byte] ^= 0x80;
+        let end = start.saturating_add(length);
+        let crc = crc32fast::hash(&bytes[start.saturating_add(8)..end]);
+        bytes[start.saturating_add(4)..start.saturating_add(8)].copy_from_slice(&crc.to_le_bytes());
+        fs::write(&path, &bytes).unwrap_or_else(|_| unreachable!("forge identity"));
+        for _ in 0..2 {
+            assert_eq!(
+                Db::open(root.path(), OpenOptions::default())
+                    .err()
+                    .map(|error| error.kind()),
+                Some(ErrorKind::Corruption)
+            );
+            assert_eq!(fs::read(&path).ok(), Some(bytes.clone()));
+        }
+    }
 }
 
 #[test]
-fn reopen_completes_manifest_first_takeover_exactly_once() {
-    let root = TestDir::new("takeover-interrupted");
-    let database =
-        Db::open(root.path(), OpenOptions::default()).unwrap_or_else(|_| unreachable!("open"));
-    let table = database
-        .create_table(spec())
-        .unwrap_or_else(|_| unreachable!("create"));
-    database
-        .append(table, &observation(10))
-        .unwrap_or_else(|_| unreachable!("append"));
-    drop(database);
-
-    let directory = directory(root.path());
-    let current = manifest::load(&directory).unwrap_or_else(|_| unreachable!("manifest"));
+fn reopen_preserves_manifest_first_takeover_exactly_once() {
+    let root = TestDir::new("shared-takeover-interrupted");
+    let table = populated(root.path());
+    let directory = DbDir::initialize(root.path()).unwrap_or_else(|_| unreachable!("directory"));
+    let current = catalog(root.path());
     let next = current
         .successor_writer_epoch()
         .unwrap_or_else(|_| unreachable!("successor"));
     manifest::publish(&directory, Some(current.identity().generation()), &next)
-        .unwrap_or_else(|_| unreachable!("publish identity"));
-    assert_eq!(segment_epochs(root.path()), vec![0]);
-
-    let database = Db::open(root.path(), OpenOptions::default())
-        .unwrap_or_else(|_| unreachable!("complete takeover"));
-    drop(database);
-    assert_eq!(segment_epochs(root.path()), vec![0, 1]);
-    let count = segment_paths(root.path()).len();
-    let database = Db::open(root.path(), OpenOptions::default())
-        .unwrap_or_else(|_| unreachable!("stable reopen"));
-    drop(database);
-    assert_eq!(segment_paths(root.path()).len(), count);
+        .unwrap_or_else(|_| unreachable!("publish epoch"));
+    let physical = segments(root.path());
+    for _ in 0..2 {
+        let database = Db::open(root.path(), OpenOptions::default())
+            .unwrap_or_else(|_| unreachable!("reopen"));
+        latest(&database, table, 20);
+        assert_eq!(catalog(root.path()), next);
+        assert_eq!(segments(root.path()), physical);
+    }
 }
 
 #[test]
-fn takeover_capacity_is_recovered_before_identity_changes() {
-    let root = TestDir::new("takeover-capacity");
-    let options = OpenOptions {
-        sync_policy: SyncPolicy::Manual,
-        seal_policy: SealPolicy {
-            bytes: 185,
-            ..SealPolicy::default()
-        },
-        wal_max_bytes: 185,
-        ..OpenOptions::default()
-    };
-    let database = Db::open(
-        root.path(),
-        OpenOptions {
-            wal_max_bytes: 512,
-            ..options
-        },
-    )
-    .unwrap_or_else(|_| unreachable!("open"));
-    let table = database
+fn closed_old_generation_and_new_generation_never_share_facts_or_bindings() {
+    let root = TestDir::new("shared-generation-isolation");
+    let old_id = SharedDbId::new([1; 16], [2; 16]);
+    let new_id = SharedDbId::new([1; 16], [3; 16]);
+    let old_path = root.path().join("old");
+    let new_path = root.path().join("new");
+    let wal_path = root.path().join("owner");
+    let owner = SharedWal::open(&wal_path, SharedWalOptions::default())
+        .unwrap_or_else(|_| unreachable!("owner"));
+    let old = owner
+        .open_db(&old_path, old_id, OpenOptions::default())
+        .unwrap_or_else(|_| unreachable!("old"));
+    let old_table = old
         .create_table(spec())
-        .unwrap_or_else(|_| unreachable!("create"));
-    for timestamp in [10, 20] {
-        database
-            .append(table, &observation(timestamp))
-            .unwrap_or_else(|_| unreachable!("append"));
+        .unwrap_or_else(|_| unreachable!("old table"));
+    old.append(old_table, &observation(10))
+        .unwrap_or_else(|_| unreachable!("old append"));
+    old.sync().unwrap_or_else(|_| unreachable!("old sync"));
+    drop(old);
+    let binding = fs::read(old_path.join("SHARED")).unwrap_or_default();
+    assert!(
+        owner
+            .open_db(&old_path, new_id, OpenOptions::default())
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(old_path.join("SHARED")).unwrap_or_default(),
+        binding
+    );
+    let new = owner
+        .open_db(&new_path, new_id, OpenOptions::default())
+        .unwrap_or_else(|_| unreachable!("new"));
+    let new_table = new
+        .create_table(spec())
+        .unwrap_or_else(|_| unreachable!("new table"));
+    assert_eq!(new_table, old_table);
+    new.append(new_table, &observation(100))
+        .unwrap_or_else(|_| unreachable!("new append"));
+    new.sync().unwrap_or_else(|_| unreachable!("new sync"));
+    drop(new);
+    drop(owner);
+    for _ in 0..2 {
+        let owner = SharedWal::open(&wal_path, SharedWalOptions::default())
+            .unwrap_or_else(|_| unreachable!("reopen owner"));
+        let old = owner
+            .open_db(&old_path, old_id, OpenOptions::default())
+            .unwrap_or_else(|_| unreachable!("reopen old"));
+        let new = owner
+            .open_db(&new_path, new_id, OpenOptions::default())
+            .unwrap_or_else(|_| unreachable!("reopen new"));
+        latest(&old, old_table, 10);
+        latest(&new, new_table, 100);
+        assert_eq!(
+            old.maintenance_status().unwrap_or_default().visible_seq(),
+            new.maintenance_status().unwrap_or_default().visible_seq()
+        );
     }
-    let wal_bytes = database
-        .maintenance_status()
-        .unwrap_or_else(|_| unreachable!("status"))
-        .wal_bytes();
-    assert!(wal_bytes > 153);
-    assert!(wal_bytes < 185);
-    drop(database);
-    let before = manifest::load(&directory(root.path())).unwrap_or_else(|_| unreachable!());
-    let (database, report) = Db::open_with_report(
-        root.path(),
-        OpenOptions {
-            takeover: true,
-            ..options
-        },
-    )
-    .unwrap_or_else(|_| unreachable!("capacity-normalized takeover"));
-    assert_eq!(report.recovery_checkpointed_records(), 3);
-    assert_eq!(report.recovery_unit_id(), Some(1));
-    assert_eq!(report.wal_bytes(), 32);
-    assert_eq!(report.wal_storage_bytes(), 32);
-    let after = manifest::load(&directory(root.path())).unwrap_or_else(|_| unreachable!());
-    assert_eq!(
-        after.identity().generation(),
-        before.identity().generation() + 2
-    );
-    assert_eq!(
-        after.identity().writer_epoch(),
-        before.identity().writer_epoch() + 1
-    );
-    assert_eq!(after.units().len(), 1);
-    let key = StreamKey::new(table, SeriesId::new(1), FieldId::new(1));
-    assert_eq!(
-        database.snapshot().latest(&[key]).ok(),
-        Some(vec![Lookup::Value {
-            value: CellValue::UInt(7),
-            at_ts: 20,
-        }])
-    );
-    drop(database);
-    assert_eq!(segment_epochs(root.path()), vec![1]);
 }
 
 #[test]
-fn open_seals_recovered_wal_that_exceeds_the_new_runtime_policy() {
-    let root = TestDir::new("open-policy-shrink");
-    let original = OpenOptions {
-        sync_policy: SyncPolicy::Manual,
-        seal_policy: SealPolicy {
-            bytes: 90,
-            ..SealPolicy::default()
-        },
-        wal_max_bytes: 512,
-        ..OpenOptions::default()
-    };
-    let database = Db::open(root.path(), original).unwrap_or_else(|_| unreachable!("open"));
-    let table = database
-        .create_table(spec())
-        .unwrap_or_else(|_| unreachable!("create"));
-    for timestamp in [10, 20] {
-        database
-            .append(table, &observation(timestamp))
-            .unwrap_or_else(|_| unreachable!("append"));
-    }
-    drop(database);
-    let before = manifest::load(&directory(root.path())).unwrap_or_else(|_| unreachable!());
-
+fn reopened_low_watermark_seals_without_losing_recovered_records() {
+    let root = TestDir::new("shared-reopen-maintenance");
+    let table = populated(root.path());
+    let before = catalog(root.path());
     let (database, report) = Db::open_with_report(
         root.path(),
         OpenOptions {
-            wal_max_bytes: 100,
-            ..original
+            sync_policy: SyncPolicy::Manual,
+            seal_policy: SealPolicy {
+                bytes: 90,
+                ..SealPolicy::default()
+            },
+            ..OpenOptions::default()
         },
     )
-    .unwrap_or_else(|_| unreachable!("policy-normalized open"));
-    assert_eq!(report.recovery_checkpointed_records(), 3);
-    assert_eq!(report.recovery_unit_id(), Some(1));
-    assert_eq!(report.wal_bytes(), 32);
-    let after = manifest::load(&directory(root.path())).unwrap_or_else(|_| unreachable!());
+    .unwrap_or_else(|_| unreachable!("reopen"));
+    assert_eq!(report.replayed_records(), 3);
+    assert_eq!(report.recovery_checkpointed_records(), 0);
+    assert_eq!(catalog(root.path()), before);
+    let sealed = database
+        .maintain()
+        .unwrap_or_else(|_| unreachable!("maintain"))
+        .sealed()
+        .unwrap_or_else(|| unreachable!("scheduled seal"));
+    assert_eq!(sealed.checkpointed_records(), 3);
+    assert_eq!(sealed.unit_id(), Some(1));
     assert_eq!(
-        after.identity().generation(),
-        before.identity().generation() + 1
+        database
+            .maintenance_status()
+            .unwrap_or_default()
+            .wal_bytes(),
+        0
     );
+    latest(&database, table, 20);
     assert_eq!(
-        after.identity().writer_epoch(),
+        catalog(root.path()).identity().writer_epoch(),
         before.identity().writer_epoch()
-    );
-    let key = StreamKey::new(table, SeriesId::new(1), FieldId::new(1));
-    assert_eq!(
-        database.snapshot().latest(&[key]).ok(),
-        Some(vec![Lookup::Value {
-            value: CellValue::UInt(7),
-            at_ts: 20,
-        }])
     );
 }
 
 #[test]
 fn metadata_only_takeover_checkpoints_without_creating_a_unit() {
-    let root = TestDir::new("takeover-metadata-only");
-    let options = OpenOptions {
-        sync_policy: SyncPolicy::Manual,
-        seal_policy: SealPolicy {
-            bytes: 1,
-            ..SealPolicy::default()
-        },
-        wal_max_bytes: 185,
-        ..OpenOptions::default()
-    };
-    let database = Db::open(root.path(), options).unwrap_or_else(|_| unreachable!("open"));
+    let root = TestDir::new("shared-takeover-metadata");
+    let database =
+        Db::open(root.path(), OpenOptions::default()).unwrap_or_else(|_| unreachable!("open"));
     let table = database
         .create_table(spec())
         .unwrap_or_else(|_| unreachable!("create"));
+    database.sync().unwrap_or_else(|_| unreachable!("sync"));
     drop(database);
-    let before = manifest::load(&directory(root.path())).unwrap_or_else(|_| unreachable!());
-
-    let (database, report) = Db::open_with_report(
-        root.path(),
-        OpenOptions {
-            takeover: true,
-            ..options
-        },
-    )
-    .unwrap_or_else(|_| unreachable!("metadata takeover"));
-    assert_eq!(report.recovery_checkpointed_records(), 1);
-    assert_eq!(report.recovery_unit_id(), None);
-    assert_eq!(report.wal_bytes(), 32);
-    assert_eq!(report.wal_storage_bytes(), 32);
-    let after = manifest::load(&directory(root.path())).unwrap_or_else(|_| unreachable!());
-    assert_eq!(
-        after.identity().generation(),
-        before.identity().generation() + 2
-    );
-    assert_eq!(after.units().len(), 0);
-    let key = StreamKey::new(table, SeriesId::new(1), FieldId::new(1));
-    assert_eq!(
-        database.snapshot().latest(&[key]).ok(),
-        Some(vec![Lookup::Missing])
-    );
-}
-
-#[test]
-fn full_wal_completes_an_already_published_epoch_after_recovery_seal() {
-    let root = TestDir::new("takeover-interrupted-full");
-    let options = OpenOptions {
-        sync_policy: SyncPolicy::Manual,
-        seal_policy: SealPolicy {
-            bytes: 90,
-            ..SealPolicy::default()
-        },
-        wal_max_bytes: 185,
-        ..OpenOptions::default()
-    };
+    let before = catalog(root.path());
     let database = Db::open(
         root.path(),
         OpenOptions {
-            wal_max_bytes: 512,
-            ..options
+            takeover: true,
+            ..OpenOptions::default()
         },
     )
-    .unwrap_or_else(|_| unreachable!("open"));
-    let table = database
-        .create_table(spec())
-        .unwrap_or_else(|_| unreachable!("create"));
-    for timestamp in [10, 20] {
+    .unwrap_or_else(|_| unreachable!("takeover"));
+    let sealed = database
+        .seal()
+        .unwrap_or_else(|_| unreachable!("seal metadata"));
+    assert_eq!(sealed.checkpointed_records(), 1);
+    assert_eq!(sealed.unit_id(), None);
+    assert_eq!(
+        catalog(root.path()).identity().writer_epoch(),
+        before.identity().writer_epoch().saturating_add(1)
+    );
+    assert_eq!(catalog(root.path()).units().len(), 0);
+    assert_eq!(
+        database.snapshot().table_last_timestamp(table).ok(),
+        Some(None)
+    );
+    assert_eq!(
         database
-            .append(table, &observation(timestamp))
-            .unwrap_or_else(|_| unreachable!("append"));
-    }
-    drop(database);
-
-    let directory = directory(root.path());
-    let current = manifest::load(&directory).unwrap_or_else(|_| unreachable!("manifest"));
-    let published = current
-        .successor_writer_epoch()
-        .unwrap_or_else(|_| unreachable!("successor"));
-    manifest::publish(
-        &directory,
-        Some(current.identity().generation()),
-        &published,
-    )
-    .unwrap_or_else(|_| unreachable!("publish identity"));
-
-    let (database, report) = Db::open_with_report(root.path(), options)
-        .unwrap_or_else(|_| unreachable!("complete interrupted takeover"));
-    assert_eq!(report.recovery_checkpointed_records(), 3);
-    assert_eq!(report.recovery_unit_id(), Some(1));
-    assert_eq!(report.wal_bytes(), 32);
-    assert_eq!(report.wal_storage_bytes(), 32);
-    let after = manifest::load(&directory).unwrap_or_else(|_| unreachable!("manifest"));
-    assert_eq!(
-        after.identity().generation(),
-        published.identity().generation() + 1
+            .maintenance_status()
+            .unwrap_or_default()
+            .wal_bytes(),
+        0
     );
-    assert_eq!(
-        after.identity().writer_epoch(),
-        published.identity().writer_epoch()
-    );
-    drop(database);
-    assert_eq!(segment_epochs(root.path()), vec![1]);
 }

@@ -35,42 +35,7 @@ use crate::{
 use recover_epoch::{ensure_epoch_order, validate_prefix};
 use recover_scan::replay_segment;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Checkpoint {
-    segment_first_seq: u64,
-    offset: u64,
-    next_seq: u64,
-}
-
-impl Checkpoint {
-    pub(crate) fn new(segment_first_seq: u64, offset: u64, next_seq: u64) -> Result<Self> {
-        let header = u64::try_from(SEGMENT_HEADER_BYTES)
-            .map_err(|_| Error::corruption("WAL checkpoint", "header length does not fit u64"))?;
-        if next_seq == 0 || segment_first_seq > next_seq || offset < header {
-            return Err(Error::corruption(
-                "WAL checkpoint",
-                "sequence or offset relationship is invalid",
-            ));
-        }
-        Ok(Self {
-            segment_first_seq,
-            offset,
-            next_seq,
-        })
-    }
-
-    pub(crate) const fn segment_first_seq(self) -> u64 {
-        self.segment_first_seq
-    }
-
-    pub(crate) const fn offset(self) -> u64 {
-        self.offset
-    }
-
-    pub(crate) const fn next_seq(self) -> u64 {
-        self.next_seq
-    }
-}
+use super::Checkpoint;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RecoveryOutcome {
@@ -147,9 +112,9 @@ pub(crate) fn recover<T: ReplayTarget>(
 ) -> Result<RecoveryOutcome> {
     let segments = discover_segments(directory)?;
     let start = segments
-        .binary_search_by_key(&checkpoint.segment_first_seq, |segment| segment.first_seq)
+        .binary_search_by_key(&checkpoint.segment_first_seq(), |segment| segment.first_seq)
         .map_err(|_| Error::corruption("WAL recovery", "checkpoint segment is absent"))?;
-    let mut expected_seq = checkpoint.next_seq;
+    let mut expected_seq = checkpoint.next_seq();
     let mut active_segment = None;
     let mut active_offset = 0_u64;
     let mut active_epoch = None;
@@ -193,7 +158,7 @@ pub(crate) fn recover<T: ReplayTarget>(
         ensure_epoch_order(previous_epoch, header.writer_epoch())?;
         previous_epoch = Some(header.writer_epoch());
         let position = if is_checkpoint {
-            checkpoint.offset
+            checkpoint.offset()
         } else {
             header_len
         };
@@ -216,7 +181,7 @@ pub(crate) fn recover<T: ReplayTarget>(
             effective_len,
             header_len,
             is_checkpoint,
-            checkpoint.offset,
+            checkpoint.offset(),
         )?;
         active_segment = Some(segment.first_seq);
         active_offset = effective_len;
@@ -235,7 +200,7 @@ pub(crate) fn recover<T: ReplayTarget>(
             .ok_or_else(|| Error::corruption("WAL recovery", "active segment epoch is absent"))?,
         wal_bytes,
         replayed_records: expected_seq
-            .checked_sub(checkpoint.next_seq)
+            .checked_sub(checkpoint.next_seq())
             .ok_or_else(|| Error::corruption("WAL recovery", "replay count underflow"))?,
         tail_repairs,
         repaired_bytes,

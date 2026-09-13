@@ -3,7 +3,8 @@
 // This file is part of LiteSDB. See LICENSE for license details.
 // Project: https://github.com/probair/litesdb
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "bench-metrics"), forbid(unsafe_code))]
+#![cfg_attr(feature = "bench-metrics", deny(unsafe_code))]
 #![deny(rust_2018_idioms, rust_2021_compatibility, unused_must_use)]
 #![deny(
     clippy::all,
@@ -17,8 +18,11 @@
 mod agg;
 #[cfg(feature = "archive")]
 pub mod archive;
+#[cfg(feature = "bench-metrics")]
+pub mod bench_metrics;
 mod codec;
 mod db;
+mod db_export;
 mod db_open;
 mod error;
 mod fsutil;
@@ -30,6 +34,7 @@ mod options;
 mod query;
 mod retention;
 mod scheduler;
+mod shared_wal;
 mod telemetry;
 mod types;
 mod unit;
@@ -47,6 +52,9 @@ pub use maintenance::{CompactLevel, CompactReport, RetentionReport, SealReport};
 pub use options::{CompactionPolicy, OpenOptions, SealPolicy, SyncPolicy};
 pub use query::{Fact, FactCursor, Lookup, Slot, Snapshot};
 pub use scheduler::MaintenanceReport;
+pub use shared_wal::{
+    SharedDbId, SharedDurablePosition, SharedWal, SharedWalOptions, SharedWalStatus,
+};
 pub use telemetry::{MaintenanceStatus, OpenReport};
 pub use types::{
     CellValue, F32Bits, FieldId, FieldSchema, Observation, ObservationEntry, SeriesId, Sq1,

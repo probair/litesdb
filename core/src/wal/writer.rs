@@ -8,6 +8,9 @@
     reason = "consumed by the database writer facade later in M3/M6"
 )]
 
+#[cfg(feature = "bench-metrics")]
+use crate::bench_metrics::{Span, Stage};
+
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read},
@@ -26,10 +29,6 @@ use crate::{
     },
 };
 
-#[cfg(feature = "archive")]
-#[path = "writer_archive.rs"]
-mod writer_archive;
-
 #[path = "writer_io.rs"]
 mod writer_io;
 
@@ -42,29 +41,7 @@ mod writer_storage;
 
 pub(crate) use writer_config::WriterConfig;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DurablePosition {
-    seq: u64,
-    segment: u64,
-    offset: u64,
-}
-
-impl DurablePosition {
-    #[must_use]
-    pub const fn seq(self) -> u64 {
-        self.seq
-    }
-
-    #[must_use]
-    pub const fn segment(self) -> u64 {
-        self.segment
-    }
-
-    #[must_use]
-    pub const fn offset(self) -> u64 {
-        self.offset
-    }
-}
+pub(crate) use super::DurablePosition;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AppendOutcome {
@@ -125,8 +102,6 @@ pub(crate) struct WalWriter<I = SystemWalIo> {
     unsynced_bytes: u64,
     durable: DurablePosition,
     poisoned: bool,
-    #[cfg(feature = "archive")]
-    archive: Option<crate::archive::ArchiveStore>,
 }
 
 impl WalWriter<SystemWalIo> {
@@ -207,8 +182,6 @@ impl WalWriter<SystemWalIo> {
                 offset: recovery.active_offset(),
             },
             poisoned: false,
-            #[cfg(feature = "archive")]
-            archive: None,
         })
     }
 }
@@ -267,18 +240,22 @@ impl<I: WalIo> WalWriter<I> {
                 offset,
             },
             poisoned: false,
-            #[cfg(feature = "archive")]
-            archive: None,
         })
     }
 
     pub(crate) fn append(&mut self, body: &RecordBody) -> Result<AppendOutcome> {
+        #[cfg(feature = "bench-metrics")]
+        let _profile = Span::new(Stage::WalAppend);
         self.ensure_healthy()?;
         let following_seq = self
             .next_seq
             .checked_add(1)
             .ok_or_else(|| Error::limit("wal_sequence", u64::MAX, u64::MAX))?;
-        let frame = record::encode(self.next_seq, body)?;
+        let frame = {
+            #[cfg(feature = "bench-metrics")]
+            let _profile = Span::new(Stage::WalEncode);
+            record::encode(self.next_seq, body)?
+        };
         let frame_bytes = u64::try_from(frame.len())
             .map_err(|_| Error::limit("wal_record_bytes", u64::MAX, u64::MAX))?;
         if self.frame_requires_checkpoint(frame_bytes)? {
@@ -308,13 +285,6 @@ impl<I: WalIo> WalWriter<I> {
         if rolls {
             self.roll_segment(self.next_seq)?;
         }
-        #[cfg(feature = "archive")]
-        self.archive_stage(
-            self.offset
-                .checked_add(frame_bytes)
-                .ok_or_else(|| Error::corruption("archive", "position overflow"))?,
-            &frame,
-        )?;
         if self
             .io
             .write_all(IoStep::RecordWrite, &mut self.file, &frame)
@@ -358,8 +328,6 @@ impl<I: WalIo> WalWriter<I> {
         {
             return self.poison();
         }
-        #[cfg(feature = "archive")]
-        self.archive_commit()?;
         self.durable = DurablePosition {
             seq: self.last_seq,
             segment: self.segment_first_seq,
@@ -374,6 +342,8 @@ impl<I: WalIo> WalWriter<I> {
     }
 
     fn roll_segment_with_headroom(&mut self, first_seq: u64, recovery: bool) -> Result<()> {
+        #[cfg(feature = "bench-metrics")]
+        let _profile = Span::new(Stage::Rotation);
         self.reserve_transition_header(recovery)?;
         if self
             .io
@@ -382,8 +352,6 @@ impl<I: WalIo> WalWriter<I> {
         {
             return self.poison();
         }
-        #[cfg(feature = "archive")]
-        self.archive_commit()?;
         self.durable = DurablePosition {
             seq: self.last_seq,
             segment: self.segment_first_seq,

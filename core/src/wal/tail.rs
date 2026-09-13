@@ -129,12 +129,29 @@ impl TailTable {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "bench-metrics"), derive(Clone))]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TailIndex {
     tables: BTreeMap<TableId, TailTable>,
     table_high_water: u32,
     next_seq: u64,
     estimated_bytes: u64,
+}
+
+#[cfg(feature = "bench-metrics")]
+impl Clone for TailIndex {
+    fn clone(&self) -> Self {
+        use crate::bench_metrics::{self, Counter, Span, Stage};
+        let _profile = Span::new(Stage::TailCow);
+        bench_metrics::count(Counter::CowCopies, 1);
+        bench_metrics::count(Counter::CowBytes, self.estimated_bytes);
+        Self {
+            tables: self.tables.clone(),
+            table_high_water: self.table_high_water,
+            next_seq: self.next_seq,
+            estimated_bytes: self.estimated_bytes,
+        }
+    }
 }
 
 impl TailIndex {

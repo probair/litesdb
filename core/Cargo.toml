@@ -17,6 +17,7 @@ name = "litesdb_core"
 
 [features]
 default = []
+bench-metrics = []
 archive = ["dep:sha2"]
 
 [dependencies]

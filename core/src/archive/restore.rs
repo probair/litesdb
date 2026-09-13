@@ -84,7 +84,7 @@ impl RestoreBuilder {
             fs::remove_dir_all(&generation)?;
         }
         restore_io::install_files(base, base_directory, &generation)?;
-        let db = Db::open_for_restore(&generation, options)?;
+        let db = Db::open_for_restore(&generation, options, base.cursor)?;
         if db.lock_engine()?.tail.next_seq().checked_sub(1) != Some(base.cursor.seq) {
             return Err(super::invalid("base catalog and cursor disagree"));
         }
@@ -205,7 +205,7 @@ impl RestoreBuilder {
             "RESTORE-WORK",
             &self.state.encode(),
         )?;
-        let db = Db::open_for_restore(&target, self.options)?;
+        let db = Db::open_for_restore(&target, self.options, self.state.cursor)?;
         let mut reader = Reader::new(&chunk.records);
         while !reader.remaining().is_empty() {
             let (_, _, _, raw) = read_record(&mut reader)?;
@@ -247,12 +247,7 @@ impl RestoreBuilder {
             )?;
             let ready_dir = DbDir::initialize(&ready)?;
             publish_atomically(&ready_dir, Area::Root, "RESTORE-WORK", &self.state.encode())?;
-            publish_atomically(
-                &ready_dir,
-                Area::Root,
-                "ARCHIVE-ORIGIN",
-                &super::store::encode_origin(self.state.cursor),
-            )?;
+            super::sealed::publish(&ready, self.state.cursor, self.state.base_id)?;
             self.directory.sync(Area::Root)?;
             publish_atomically(
                 &self.directory,

@@ -94,7 +94,7 @@ pub(super) fn validate(tail: &TailIndex, seq: u64, body: &RecordBody) -> Result<
     Ok(())
 }
 
-pub(super) fn estimate_row_bytes(entry_count: usize) -> Result<u64> {
+pub(crate) fn estimate_row_bytes(entry_count: usize) -> Result<u64> {
     let row = u64::try_from(size_of::<TailRow>()).map_err(|_| tail_memory_overflow())?;
     let entry_width = size_of::<ObservationEntry>()
         .checked_add(size_of::<u32>())

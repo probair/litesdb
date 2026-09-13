@@ -3,6 +3,9 @@
 // This file is part of LiteSDB. See LICENSE for license details.
 // Project: https://github.com/probair/litesdb
 
+#[cfg(feature = "bench-metrics")]
+use crate::bench_metrics::{Span, Stage};
+
 use std::fs;
 
 use super::{DurablePosition, IoStep, SEGMENT_HEADER_BYTES, SystemWalIo, WalIo, WalWriter};
@@ -20,8 +23,8 @@ impl<I: WalIo> WalWriter<I> {
     }
 
     pub(super) fn frame_requires_checkpoint(&mut self, frame_bytes: u64) -> Result<bool> {
-        #[cfg(feature = "archive")]
-        self.archive_admit(frame_bytes)?;
+        #[cfg(feature = "bench-metrics")]
+        let _profile = Span::new(Stage::WalCapacity);
         let limit = u64::from(self.config.wal_limit);
         let minimum = frame_bytes
             .checked_add(SEGMENT_HEADER_BYTES as u64)
@@ -46,6 +49,8 @@ impl<I: WalIo> WalWriter<I> {
         {
             return Ok(true);
         }
+        #[cfg(feature = "bench-metrics")]
+        let _profile = Span::new(Stage::WalReclaim);
         match storage::reclaim(&self.wal_directory, required, limit) {
             Ok(bytes) => {
                 self.storage_bytes = bytes;
@@ -99,9 +104,9 @@ impl<I: WalIo> WalWriter<I> {
     }
 
     pub(crate) fn checkpoint(&mut self) -> Result<()> {
+        #[cfg(feature = "bench-metrics")]
+        let _profile = Span::new(Stage::WalReclaim);
         self.ensure_healthy()?;
-        #[cfg(feature = "archive")]
-        self.archive_protected()?;
         let mut removed = false;
         for entry in fs::read_dir(&self.wal_directory)? {
             let entry = entry?;

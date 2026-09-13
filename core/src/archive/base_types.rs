@@ -78,7 +78,7 @@ impl BaseDescriptor {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"LSBD\x01\0\0\0");
+        bytes.extend_from_slice(b"LSBD\x02\0\0\0");
         bytes.extend_from_slice(&self.id);
         bytes.extend_from_slice(&self.cursor.to_bytes());
         bytes.extend_from_slice(
@@ -107,11 +107,11 @@ impl BaseDescriptor {
             ));
         }
         let mut reader = Reader::new(bytes);
-        reader.magic(b"LSBD\x01\0\0\0")?;
+        reader.magic(b"LSBD\x02\0\0\0")?;
         let id = reader.array()?;
         let cursor = ArchiveCursor::from_bytes(reader.take(CURSOR_BYTES)?)?;
         let count = reader.u32()? as usize;
-        if !(2..=MAX_BASE_FILES).contains(&count) {
+        if !(1..=MAX_BASE_FILES).contains(&count) {
             return Err(super::invalid("base file count"));
         }
         let mut files = Vec::new();
@@ -141,16 +141,8 @@ impl BaseDescriptor {
             });
         }
         reader.finish()?;
-        if !files.iter().any(|file| file.path == "MANIFEST")
-            || files
-                .iter()
-                .filter(|file| file.path.starts_with("wal/"))
-                .count()
-                != 1
-        {
-            return Err(super::invalid(
-                "base requires one catalog and one empty WAL segment",
-            ));
+        if !files.iter().any(|file| file.path == "MANIFEST") {
+            return Err(super::invalid("base requires one logical catalog"));
         }
         Ok(Self { id, cursor, files })
     }
@@ -163,9 +155,6 @@ pub(crate) fn validate_path(path: &str) -> Result<()> {
         return Err(super::invalid("base file path"));
     };
     match area {
-        "wal" => {
-            crate::wal::segment::parse_segment_name(name)?;
-        }
         "units" | "heads" => {
             let suffix = if area == "units" { ".lsu" } else { ".lsr" };
             let raw = name

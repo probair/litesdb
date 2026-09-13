@@ -3,10 +3,22 @@
 // This file is part of LiteSDB. See LICENSE for license details.
 // Project: https://github.com/probair/litesdb
 
-use super::{ArchiveCursor, ArchiveOptions, ArchiveStatus, ArchiveStore, ExportChunk};
-use crate::{Db, OpenOptions, Result, fsutil::DbDir};
-use std::{path::Path, sync::Arc};
+use super::{ArchiveCursor, ArchiveOptions, ArchiveStatus, ExportChunk};
+use crate::{Db, OpenOptions, Result};
+use std::path::Path;
 impl Db {
+    pub(crate) fn enable_archive(&self, options: ArchiveOptions) -> Result<()> {
+        let mut engine = self.lock_engine()?;
+        if engine
+            .writer
+            .archive_status()
+            .is_err_and(|error| error.kind() == crate::ErrorKind::Unsupported)
+        {
+            self.seal_locked(&mut engine)?;
+        }
+        engine.writer.enable_archive(options)
+    }
+
     pub fn open_with_archive(
         root: &Path,
         options: OpenOptions,
@@ -33,18 +45,4 @@ impl Db {
     pub fn release_archive(&self, through: ArchiveCursor) -> Result<()> {
         self.lock_engine()?.writer.release_archive(through)
     }
-}
-pub(crate) fn preflight(
-    directory: &Arc<DbDir>,
-    options: Option<ArchiveOptions>,
-) -> Result<Option<ArchiveStore>> {
-    let Some(options) = options else {
-        return Ok(None);
-    };
-    let store = ArchiveStore::load(Arc::clone(directory), options)?;
-    if let Some(store) = &store {
-        let manifest = crate::manifest::load(directory)?;
-        store.ensure_protected(manifest.checkpoint().next_seq().saturating_sub(1))?;
-    }
-    Ok(store)
 }

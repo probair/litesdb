@@ -3,6 +3,9 @@
 // This file is part of LiteSDB. See LICENSE for license details.
 // Project: https://github.com/probair/litesdb
 
+#[cfg(feature = "bench-metrics")]
+use crate::bench_metrics::{Span, Stage};
+
 use std::{fs, sync::Arc};
 
 use crate::{
@@ -92,16 +95,18 @@ impl Db {
     }
 
     pub(crate) fn seal_locked(&self, engine: &mut crate::db::Engine) -> Result<SealReport> {
+        #[cfg(feature = "bench-metrics")]
+        let _profile = Span::new(Stage::Seal);
         engine.writer.ensure_healthy()?;
         lifecycle_gc::reap(&self.directory, &mut engine.garbage);
         let start_seq = engine.manifest.checkpoint().next_seq();
         let end_seq = engine.tail.next_seq();
-        if start_seq == end_seq && !engine.writer.needs_rotation() {
+        if start_seq == end_seq {
             return Ok(SealReport::default());
         }
-        let durable = engine.writer.prepare_checkpoint(&self.directory)?;
+        engine.writer.prepare_checkpoint(&self.directory)?;
         engine.last_sync = std::time::Instant::now();
-        let checkpoint = Checkpoint::new(durable.segment(), durable.offset(), end_seq)?;
+        let checkpoint = Checkpoint::new(1, 32, end_seq)?;
         let has_rows = engine
             .tail
             .tables()
@@ -212,11 +217,14 @@ impl Db {
                 .source
                 .reopen(&self.directory.path(Area::Units), next.units())?,
         );
-        manifest::publish(
+        if let Err(error) = manifest::publish(
             &self.directory,
             Some(engine.manifest.identity().generation()),
             &next,
-        )?;
+        ) {
+            engine.writer.mark_poisoned();
+            return Err(error);
+        }
         engine.retire(obsolete);
         engine.manifest = next;
         engine.source = source;
@@ -294,11 +302,14 @@ impl Db {
                 .source
                 .reopen(&self.directory.path(Area::Units), next.units())?,
         );
-        manifest::publish(
+        if let Err(error) = manifest::publish(
             &self.directory,
             Some(engine.manifest.identity().generation()),
             &next,
-        )?;
+        ) {
+            engine.writer.mark_poisoned();
+            return Err(error);
+        }
         engine.retire(obsolete);
         engine.manifest = next;
         engine.source = source;

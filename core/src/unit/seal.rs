@@ -3,6 +3,9 @@
 // This file is part of LiteSDB. See LICENSE for license details.
 // Project: https://github.com/probair/litesdb
 
+#[cfg(feature = "bench-metrics")]
+use crate::bench_metrics::{Span, Stage};
+
 use std::cmp::min;
 
 use crate::{
@@ -117,6 +120,8 @@ pub(crate) fn assemble_and_publish(
     snapshot: &TailIndex,
     unit_id: u64,
 ) -> Result<UnitMeta> {
+    #[cfg(feature = "bench-metrics")]
+    let _profile = Span::new(Stage::UnitSeal);
     let sources = collect_sources(snapshot)?;
     let mut spool = UnitSpool::new(directory, 0, unit_id)?;
     for source in sources {

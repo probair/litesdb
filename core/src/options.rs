@@ -9,11 +9,9 @@ use crate::{
     Error, Result,
     limits::{
         DEFAULT_DIRECTORY_CACHE_BYTES, DEFAULT_L1_WINDOW_SECS, DEFAULT_L2_WINDOW_SECS,
-        DEFAULT_SEAL_BYTES, DEFAULT_SEAL_INTERVAL_SECS, DEFAULT_SEAL_MEMORY_BYTES,
-        DEFAULT_WAL_BYTES, DEFAULT_WAL_SEGMENT_BYTES, Limit, MAX_SEAL_MEMORY_BYTES,
-        MIN_COMPACTION_WINDOW_SECS, ensure_at_most,
+        DEFAULT_SEAL_BYTES, DEFAULT_SEAL_INTERVAL_SECS, DEFAULT_SEAL_MEMORY_BYTES, Limit,
+        MAX_SEAL_MEMORY_BYTES, MIN_COMPACTION_WINDOW_SECS, ensure_at_most,
     },
-    wal::WriterConfig,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,8 +58,6 @@ pub struct OpenOptions {
     pub sync_policy: SyncPolicy,
     pub seal_policy: SealPolicy,
     pub compaction: CompactionPolicy,
-    pub wal_max_bytes: u32,
-    pub wal_segment_bytes: u32,
     pub directory_cache_bytes: u32,
     pub takeover: bool,
 }
@@ -75,28 +71,27 @@ impl Default for OpenOptions {
             },
             seal_policy: SealPolicy::default(),
             compaction: CompactionPolicy::default(),
-            wal_max_bytes: DEFAULT_WAL_BYTES,
-            wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
             directory_cache_bytes: DEFAULT_DIRECTORY_CACHE_BYTES,
             takeover: false,
         }
     }
 }
 
-pub(crate) fn validate(options: OpenOptions) -> Result<WriterConfig> {
+pub(crate) fn validate(options: OpenOptions) -> Result<()> {
     ensure_at_most(
         Limit::DirectoryCacheBytes,
         u64::from(options.directory_cache_bytes),
     )?;
     if let SyncPolicy::Interval { every, bytes } = options.sync_policy
-        && (every.is_zero() || bytes == 0 || bytes > options.wal_max_bytes)
+        && (every.is_zero() || bytes == 0)
     {
         return Err(Error::invalid(
             "sync policy",
-            "interval and byte threshold must be positive and fit the WAL budget",
+            "interval and byte threshold must be positive",
         ));
     }
-    if options.seal_policy.interval.is_zero()
+    if options.seal_policy.bytes == 0
+        || options.seal_policy.interval.is_zero()
         || options.seal_policy.memory_bytes == 0
         || options.seal_policy.memory_bytes > MAX_SEAL_MEMORY_BYTES
     {
@@ -106,11 +101,7 @@ pub(crate) fn validate(options: OpenOptions) -> Result<WriterConfig> {
         ));
     }
     validate_compaction(options.compaction)?;
-    WriterConfig::new(
-        options.wal_segment_bytes,
-        options.wal_max_bytes,
-        options.seal_policy.bytes,
-    )
+    Ok(())
 }
 
 fn validate_compaction(policy: CompactionPolicy) -> Result<()> {

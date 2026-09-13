@@ -3,18 +3,17 @@
 // This file is part of LiteSDB. See LICENSE for license details.
 // Project: https://github.com/probair/litesdb
 
-mod base;
+pub(crate) mod base;
 mod base_types;
 mod facade;
 pub use base_types::{BaseDescriptor, BaseFile, FrozenBase};
 mod restore;
 mod restore_io;
+pub(crate) mod sealed;
 pub use restore::{RestoreBuilder, RestoredDbDescriptor};
-mod format;
-mod store;
-mod types;
-pub(crate) use facade::preflight;
-pub(crate) use store::ArchiveStore;
+pub(crate) mod format;
+pub(crate) mod types;
+
 pub use types::{ArchiveCursor, ArchiveOptions, ArchiveStatus, ExportChunk};
 
 pub(crate) fn invalid(reason: &'static str) -> crate::Error {
